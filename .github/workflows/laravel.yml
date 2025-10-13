@@ -1,0 +1,44 @@
+name: baileys_trans
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v2
+
+      - name: Configurar QEMU para compatibilidad multi-arquitectura
+        uses: docker/setup-qemu-action@master
+        with:
+          platforms: all
+
+      - name: Iniciar sesión en Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Construir y subir la imagen Docker
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/baileys_trans:latest
+          build-args: APT_DEBUG=true
+          outputs: type=registry
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          progress: plain

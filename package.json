@@ -1,0 +1,23 @@
+{
+  "name": "pruebaqr",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.3",
+    "axios": "^1.11.0",
+    "bull": "^4.16.5",
+    "express": "^5.1.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "ioredis": "^5.7.0",
+    "pino": "^9.9.0",
+    "qrcode-terminal": "^0.12.0",
+    "uuid": "^11.1.0"
+  }
+}

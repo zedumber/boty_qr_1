@@ -1,0 +1,27 @@
+# Dependencias
+/node_modules
+
+# Archivos de credenciales Baileys
+/auth
+
+# Audios temporales
+/audios
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Entornos
+.env
+.env.local
+.env.*.local
+
+# Compilados o caché
+dist
+.cache
+.next
+out
+build
