@@ -4,7 +4,7 @@
 
 module.exports = {
   // 🌐 API de Laravel
-  laravelApi: process.env.LARAVEL_API || "http://localhost:8000/api",
+  laravelApi: process.env.LARAVEL_API || "http://boty_qr_back:8030/api",
   // laravelApi: "https://botyqr.tecsolbd.com/api",
   // laravelApi: "http://boty_qr_back:8030/api",
 
@@ -12,7 +12,8 @@ module.exports = {
   port: process.env.PORT || 4000,
 
   // 📊 Redis
-  redisHost: process.env.REDIS_HOST || "localhost",
+  // redisHost: process.env.REDIS_HOST || "localhost",
+  redisHost: process.env.REDIS_HOST || "redis_saas",
   // redisHost: 'redis_saas', // nombre del servicio Docker
   redisPort: process.env.REDIS_PORT || 6379,
 
