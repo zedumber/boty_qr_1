@@ -1,4 +1,4 @@
-name: baileys_trans
+name: baileys
 
 on:
   push:
@@ -36,7 +36,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/baileys_trans:latest
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/baileys:latest
           build-args: APT_DEBUG=true
           outputs: type=registry
           cache-from: type=gha
