@@ -1,11 +1,8 @@
 # Usa una imagen ligera de Node.js
-FROM --platform=linux/amd64 node:20-alpine
+FROM node:20-alpine
 
 # Establece directorio de trabajo dentro del contenedor
 WORKDIR /app
-
-# Instalar nano en Alpine
-RUN apk update && apk add nano
 
 # Copia package.json y package-lock.json primero (para aprovechar cache de Docker)
 COPY package*.json ./
