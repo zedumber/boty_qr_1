@@ -4,9 +4,9 @@
 
 module.exports = {
   // 🌐 API de Laravel
-  laravelApi: process.env.LARAVEL_API || "http://boty_qr_back:8005/api",
+  // laravelApi: process.env.LARAVEL_API || "http://boty_qr_back:8005/api",
   // laravelApi: "https://botyqr.tecsolbd.com/api",
-  // laravelApi: "http://boty_qr_back:8030/api",
+  laravelApi: "http://boty_qr_back:8005/api",
 
   // 🔌 Servidor Node
   port: process.env.PORT || 4000,

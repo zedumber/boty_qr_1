@@ -22,7 +22,7 @@ const { v4: uuidv4 } = require("uuid");
 const config = require("./config/config");
 const logger = require("./utils/logger");
 const { QueueManager } = require("./modules/queueManager");
-const WhatsAppManager = require("./modules/whatsappManager");
+const WhatsAppManager = require("./modules/whatsapp"); // Nueva arquitectura modular
 const MessageReceiver = require("./modules/messageReceiver");
 const MessageSender = require("./modules/messageSender");
 
@@ -100,7 +100,13 @@ async function initializeModules() {
       axiosHttp,
       config.laravelApi,
       logger,
-      queueManager
+      queueManager,
+      {
+        authDir: config.authDir,
+        maxRetries: config.maxRetries || 3,
+        qrThrottleMs: config.qrThrottleMs || 30000,
+        qrExpiresMs: config.qrExpiresMs || 60000,
+      }
     );
 
     // 3. Inicializar receptor de mensajes
