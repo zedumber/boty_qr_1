@@ -95,12 +95,13 @@ async function initializeModules() {
 
     await queueManager.initialize();
 
-    // 2. Inicializar gestor de WhatsApp
+    // 2. Inicializar gestor de WhatsApp (con timeout de pending 2 minutos)
     whatsappManager = new WhatsAppManager(
       axiosHttp,
       config.laravelApi,
       logger,
-      queueManager
+      queueManager,
+      config.pendingSessionTimeout
     );
 
     // 3. Inicializar receptor de mensajes
@@ -126,6 +127,74 @@ async function initializeModules() {
     setInterval(() => {
       messageReceiver.cleanOldAudios(config.audioMaxAge);
     }, config.audioCleanupInterval);
+
+    // 7. ✅ NUEVO: Limpieza automática de sesiones inactivas cada 30 minutos
+    // Elimina sesiones que no están conectadas para evitar generar QRs innecesarios
+    setInterval(async () => {
+      try {
+        const sessions = whatsappManager.listActiveSessions();
+        const inactiveSessions = sessions.filter((s) => !s.connected);
+
+        if (inactiveSessions.length > 0) {
+          logger.info("🧹 Limpiando sesiones inactivas...", {
+            count: inactiveSessions.length,
+          });
+
+          for (const session of inactiveSessions) {
+            try {
+              await whatsappManager.deleteSession(session.sessionId);
+            } catch (err) {
+              logger.error("⚠️ Error eliminando sesión inactiva", err, {
+                sessionId: session.sessionId,
+              });
+            }
+          }
+
+          logger.info("🧹 Sesiones inactivas eliminadas", {
+            deleted: inactiveSessions.length,
+            remaining: Object.keys(whatsappManager.sessions.sessions || {})
+              .length,
+          });
+        }
+      } catch (err) {
+        logger.error("❌ Error en limpieza automática", err);
+      }
+    }, 30 * 60 * 1000); // cada 30 minutos
+
+    // 8. ✅ NUEVO: Limpieza de sesiones PENDING que vencieron (cada 30 segundos)
+    // Elimina sesiones que han estado en "pending" por más de 2 minutos sin conectarse
+    setInterval(async () => {
+      try {
+        const expiredPending = whatsappManager.qr.getExpiredPendingSessions();
+
+        if (expiredPending.length > 0) {
+          logger.info("🧹 Eliminando sesiones PENDING vencidas...", {
+            count: expiredPending.length,
+          });
+
+          for (const sessionId of expiredPending) {
+            try {
+              await whatsappManager.deleteSession(sessionId);
+              logger.info("🗑️ Sesión PENDING eliminada (vencida)", {
+                sessionId,
+              });
+            } catch (err) {
+              logger.error("⚠️ Error eliminando pending session", err, {
+                sessionId,
+              });
+            }
+          }
+
+          logger.info("🧹 Sesiones PENDING vencidas eliminadas", {
+            deleted: expiredPending.length,
+            remaining: Object.keys(whatsappManager.sessions.sessions || {})
+              .length,
+          });
+        }
+      } catch (err) {
+        logger.error("❌ Error en limpieza de pending sessions", err);
+      }
+    }, config.pendingSessionCleanupInterval); // cada 30 segundos
 
     logger.info("✅ Todos los módulos inicializados correctamente");
   } catch (error) {
@@ -292,14 +361,119 @@ app.get("/health", async (req, res) => {
 app.get("/sessions", (req, res) => {
   try {
     const sessions = whatsappManager.listActiveSessions();
+    const pendingSessions = Array.from(
+      whatsappManager.qr.pendingCreatedAt.entries()
+    ).map(([sessionId, createdAt]) => ({
+      sessionId,
+      pendingDuration: Date.now() - createdAt,
+      willExpireIn: Math.max(
+        0,
+        config.pendingSessionTimeout - (Date.now() - createdAt)
+      ),
+    }));
 
     return res.json({
       success: true,
       count: sessions.length,
       sessions,
+      pendingSessions: pendingSessions,
+      pendingCount: pendingSessions.length,
     });
   } catch (error) {
     logger.error("❌ Error listando sesiones", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 🧹 API: Eliminar sesiones inactivas (no conectadas)
+ * POST /cleanup-inactive-sessions
+ * Respuesta: { deleted: number, remaining: number }
+ */
+app.post("/cleanup-inactive-sessions", async (req, res) => {
+  try {
+    const sessions = whatsappManager.listActiveSessions();
+    const inactiveSessions = sessions.filter((s) => !s.connected);
+    let deleted = 0;
+
+    for (const session of inactiveSessions) {
+      try {
+        await whatsappManager.deleteSession(session.sessionId);
+        deleted++;
+      } catch (err) {
+        logger.error("❌ Error eliminando sesión inactiva", err, {
+          sessionId: session.sessionId,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      deleted,
+      remaining: Object.keys(whatsappManager.sessions.sessions || {}).length,
+    });
+  } catch (error) {
+    logger.error("❌ Error en cleanup", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 🧹 API: Eliminar sesiones PENDING que vencieron (>2 minutos sin conectar)
+ * POST /cleanup-pending-sessions
+ * Respuesta: { deleted: number, remaining: number }
+ */
+app.post("/cleanup-pending-sessions", async (req, res) => {
+  try {
+    const expiredPending = whatsappManager.qr.getExpiredPendingSessions();
+    let deleted = 0;
+
+    for (const sessionId of expiredPending) {
+      try {
+        await whatsappManager.deleteSession(sessionId);
+        deleted++;
+      } catch (err) {
+        logger.error("❌ Error eliminando pending session", err, { sessionId });
+      }
+    }
+
+    return res.json({
+      success: true,
+      deleted,
+      remaining: Object.keys(whatsappManager.sessions.sessions || {}).length,
+    });
+  } catch (error) {
+    logger.error("❌ Error en cleanup pending", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+        logger.error("❌ Error eliminando sesión inactiva", err, {
+          sessionId: session.sessionId,
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      deleted,
+      remaining: Object.keys(whatsappManager.sessions.sessions || {}).length,
+    });
+  } catch (error) {
+    logger.error("❌ Error en cleanup", error);
 
     return res.status(500).json({
       success: false,

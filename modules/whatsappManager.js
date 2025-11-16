@@ -10,7 +10,13 @@ const ReconnectController = require("./core/ReconnectController");
 const QrController = require("./core/QrController");
 
 class WhatsAppManager {
-  constructor(axios, laravelApi, logger, queueManager) {
+  constructor(
+    axios,
+    laravelApi,
+    logger,
+    queueManager,
+    pendingSessionTimeout = 120000
+  ) {
     this.logger = logger;
     this.axios = axios;
     this.laravelApi = laravelApi;
@@ -25,7 +31,13 @@ class WhatsAppManager {
       this.startSession(sessionId, userId)
     );
 
-    this.qr = new QrController(logger, this.sync, this.sessions);
+    // Pasar timeout de pending (2 minutos)
+    this.qr = new QrController(
+      logger,
+      this.sync,
+      this.sessions,
+      pendingSessionTimeout
+    );
   }
 
   // Inicia una sesión usando los helpers modulares
@@ -48,12 +60,17 @@ class WhatsAppManager {
       sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        if (qr) await this.qr.handle(qr, sessionId, connection);
+        // ⚠️ NUEVO: Solo generar QR si la sesión está activa en memoria
+        if (qr && this.sessions.has(sessionId)) {
+          await this.qr.handle(qr, sessionId, connection);
+        }
 
         if (connection === "open") {
           this.qr.clear(sessionId);
           this.reconnect.clear(sessionId);
 
+          // Usar LaravelSync.enqueue() en lugar de postLaravel()
+          // Evita reintentos agresivos que abren el Circuit Breaker
           this.sync.enqueue({
             path: "/whatsapp/status",
             payload: { session_id: sessionId, estado_qr: "active" },

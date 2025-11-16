@@ -13,7 +13,7 @@ module.exports = {
 
   // 📊 Redis - Escalable para 200+ usuarios
   // En producción: usar Redis Cluster o Sentinel para HA
-  redisHost: 'redis_saas', // nombre del servicio Docker
+  redisHost: "redis_saas", // nombre del servicio Docker
   // redisHost: process.env.REDIS_HOST || "localhost",
   redisPort: process.env.REDIS_PORT || 6379,
   redisMaxRetriesPerRequest: null, // crítico para Bull/colas
@@ -31,14 +31,16 @@ module.exports = {
   // Timeouts
   messageProcessingTimeout: 45000, // 45s (aumentado de 30s)
   qrGenerationTimeout: 30000, // 30s para generar QR
+  pendingSessionTimeout: process.env.PENDING_SESSION_TIMEOUT || 120000, // 2 minutos - eliminar sesiones pending sin respuesta
 
   // Reintentos con backoff exponencial
   messageMaxRetries: process.env.MESSAGE_MAX_RETRIES || 5,
   messageRetryDelay: 3000, // 3s base para backoff
 
-  // Circuit Breaker - Protección contra sobrecarga
-  circuitBreakerThreshold: process.env.CIRCUIT_BREAKER_THRESHOLD || 10,
-  circuitBreakerResetTimeout: process.env.CIRCUIT_BREAKER_RESET || 120000, // 2 minutos
+  // Circuit Breaker - Protección contra sobrecarga (pero más tolerante en producción)
+  // En producción con mucho tráfico, subir a 20-30 fallos antes de abrir
+  circuitBreakerThreshold: process.env.CIRCUIT_BREAKER_THRESHOLD || 20,
+  circuitBreakerResetTimeout: process.env.CIRCUIT_BREAKER_RESET || 180000, // 3 minutos en producción
 
   // 🧹 Limpieza de recursos
   audioCleanupInterval: 15 * 60 * 1000, // 15 minutos
@@ -49,6 +51,7 @@ module.exports = {
   maxActiveSessions: process.env.MAX_ACTIVE_SESSIONS || 250, // 250 sesiones máximo
   sessionIdleTTL: 24 * 3600 * 1000, // 24 horas: sesión idle se limpia
   sessionMaxLifetime: 7 * 24 * 3600 * 1000, // 7 días: renovar credenciales
+  pendingSessionCleanupInterval: process.env.PENDING_CLEANUP_INTERVAL || 30000, // 30s - verificar y eliminar pending cada 30s
 
   // 📡 HTTP Client - Escalado para 200+ usuarios
   httpTimeout: 20000, // 20s (aumentado)
