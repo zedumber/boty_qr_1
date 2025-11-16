@@ -1,5 +1,5 @@
 # Usa una imagen ligera de Node.js
-FROM node:20-alpine
+FROM --platform=linux/amd64 node:20-alpine
 
 # Establece directorio de trabajo dentro del contenedor
 WORKDIR /app
