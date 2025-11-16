@@ -12,24 +12,36 @@ const Queue = require("bull");
 const Redis = require("ioredis");
 
 /**
- * 🔌 Circuit Breaker Pattern
- * Protege servicios externos de sobrecarga
+ * 🔌 Circuit Breaker Pattern Mejorado
+ * Protege servicios externos de sobrecarga con backoff adaptativo
+ * Soporta 200+ usuarios con recuperación inteligente
  */
 class CircuitBreaker {
-  constructor(failureThreshold = 5, resetTimeout = 60000) {
-    this.failureThreshold = failureThreshold;
-    this.resetTimeout = resetTimeout;
+  constructor(failureThreshold = 10, resetTimeout = 120000) {
+    this.failureThreshold = failureThreshold; // más tolerancia para picos
+    this.resetTimeout = resetTimeout; // 2 minutos antes de reintentar
     this.failureCount = 0;
+    this.successCount = 0;
     this.lastFailureTime = null;
     this.state = "CLOSED"; // CLOSED, OPEN, HALF_OPEN
+    this.openCount = 0; // número de veces que se abrió (para métricas)
   }
 
   async execute(callback) {
     if (this.state === "OPEN") {
-      if (Date.now() - this.lastFailureTime > this.resetTimeout) {
+      // Aumentar timeout de reset progresivamente
+      const timeElapsed = Date.now() - this.lastFailureTime;
+      const adjustedResetTime =
+        this.resetTimeout * (1 + Math.log(this.openCount) / 10);
+
+      if (timeElapsed > adjustedResetTime) {
         this.state = "HALF_OPEN";
       } else {
-        throw new Error("Circuit breaker is OPEN");
+        throw new Error(
+          `Circuit breaker OPEN (retry in ${Math.round(
+            adjustedResetTime - timeElapsed
+          )}ms)`
+        );
       }
     }
 
@@ -39,6 +51,14 @@ class CircuitBreaker {
       if (this.state === "HALF_OPEN") {
         this.state = "CLOSED";
         this.failureCount = 0;
+        this.successCount = 0;
+        this.openCount = 0;
+      } else if (this.state === "CLOSED") {
+        this.successCount++;
+        // Resetear contadores si hay éxito consistente
+        if (this.successCount > 10) {
+          this.failureCount = Math.max(0, this.failureCount - 1);
+        }
       }
 
       return result;
@@ -48,6 +68,7 @@ class CircuitBreaker {
 
       if (this.failureCount >= this.failureThreshold) {
         this.state = "OPEN";
+        this.openCount++;
       }
 
       throw error;
@@ -58,8 +79,17 @@ class CircuitBreaker {
     return {
       state: this.state,
       failureCount: this.failureCount,
+      successCount: this.successCount,
       lastFailureTime: this.lastFailureTime,
+      openCount: this.openCount,
     };
+  }
+
+  reset() {
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.state = "CLOSED";
+    this.openCount = 0;
   }
 }
 
@@ -159,33 +189,55 @@ class QueueManager {
     this.redisConfig = {
       host: config.redisHost || "localhost",
       port: config.redisPort || 6379,
-      maxRetriesPerRequest: null,
-      enableReadyCheck: false,
+      db: config.redisDb || 0,
+      maxRetriesPerRequest:
+        config.redisMaxRetriesPerRequest !== undefined
+          ? config.redisMaxRetriesPerRequest
+          : null,
+      enableReadyCheck:
+        config.redisEnableReadyCheck !== undefined
+          ? config.redisEnableReadyCheck
+          : false,
+      enableOfflineQueue:
+        config.redisEnableOfflineQueue !== undefined
+          ? config.redisEnableOfflineQueue
+          : true,
     };
 
     // Instancias
     this.messageQueue = null;
     this.qrQueue = null;
     this.redisClient = null;
-    this.circuitBreaker = new CircuitBreaker(5, 60000);
+
+    // Circuit Breaker escalado para 200+ usuarios
+    this.circuitBreaker = new CircuitBreaker(
+      this.config.circuitBreakerThreshold || 10,
+      this.config.circuitBreakerResetTimeout || 120000
+    );
+
     this.metrics = new PerformanceMetrics(logger);
 
-    // Configuraciones
-    this.maxConcurrentMessages = config.maxConcurrentMessages || 5;
-    this.messageProcessingTimeout = config.messageProcessingTimeout || 30000;
+    // Configuraciones escaladas
+    this.maxConcurrentMessages = config.maxConcurrentMessages || 20;
+    this.maxConcurrentQrGeneration = config.maxConcurrentQrGeneration || 10;
+    this.messageProcessingTimeout = config.messageProcessingTimeout || 45000;
+    this.qrGenerationTimeout = config.qrGenerationTimeout || 30000;
   }
 
   /**
-   * 🚀 Inicializa las colas y conexiones
+   * 🚀 Inicializa las colas y conexiones - Optimizado para 200+ usuarios
    */
   async initialize() {
     try {
-      this.logger.info("🔄 Inicializando sistema de colas...", {
+      this.logger.info("🔄 Inicializando sistema de colas escalado...", {
         redisHost: this.redisConfig.host,
         redisPort: this.redisConfig.port,
+        maxConcurrentMessages: this.maxConcurrentMessages,
+        maxConcurrentQr: this.maxConcurrentQrGeneration,
+        circuitBreakerThreshold: this.config.circuitBreakerThreshold || 10,
       });
 
-      // Crear cliente Redis
+      // Crear cliente Redis con configuración optimizada
       this.redisClient = new Redis(this.redisConfig);
 
       this.redisClient.on("connect", () => {
@@ -196,19 +248,37 @@ class QueueManager {
         this.logger.error("❌ Error de conexión a Redis", err);
       });
 
-      // Crear colas
+      // Crear colas separadas: mensajes y QRs
       this.messageQueue = new Queue("whatsapp-messages", {
         redis: this.redisConfig,
+        defaultJobOptions: {
+          attempts: this.config.messageMaxRetries || 5,
+          backoff: {
+            type: "exponential",
+            delay: this.config.messageRetryDelay || 3000,
+          },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
       });
 
-      this.qrQueue = new Queue("qr-processing", {
+      // Cola separada para QRs - no interfiere con mensajes
+      this.qrQueue = new Queue("qr-generation", {
         redis: this.redisConfig,
+        defaultJobOptions: {
+          attempts: 3,
+          backoff: { type: "exponential", delay: 2000 },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
       });
 
       // Configurar event listeners
       this.setupQueueEvents();
 
-      this.logger.info("✅ Sistema de colas inicializado correctamente");
+      this.logger.info(
+        "✅ Sistema de colas inicializado correctamente (200+ ready)"
+      );
     } catch (error) {
       this.logger.error("❌ Error inicializando colas", error);
       throw error;
@@ -285,7 +355,107 @@ class QueueManager {
   }
 
   /**
-   * 🔄 Configura el procesador de mensajes
+   * 🔄 Configura el procesador de mensajes (hasta 20 simultáneos)
+   *
+   * @param {Function} processorFn - Función que procesa el mensaje
+   */
+  processMessages(processorFn) {
+    this.messageQueue.process(this.maxConcurrentMessages, async (job) => {
+      const { msgUpdate, sessionId } = job.data;
+      const messageId = msgUpdate.messages[0]?.key?.id;
+
+      this.metrics.startMessage(messageId);
+
+      try {
+        this.logger.info("🔄 Procesando mensaje desde cola", {
+          jobId: job.id,
+          messageId,
+          sessionId,
+        });
+
+        const result = await processorFn(job.data);
+
+        await this.metrics.endMessage(messageId, true, this.messageQueue);
+
+        return result;
+      } catch (error) {
+        this.logger.error("❌ Error procesando mensaje", error, {
+          jobId: job.id,
+          messageId,
+          sessionId,
+        });
+
+        await this.metrics.endMessage(messageId, false, this.messageQueue);
+
+        throw error;
+      }
+    });
+
+    this.logger.info("✅ Procesador de mensajes configurado", {
+      maxConcurrent: this.maxConcurrentMessages,
+    });
+  }
+
+  /**
+   * 📲 Agrega trabajo de generación QR a la cola (procesamiento paralelo)
+   *
+   * @param {string} qr - Código QR string
+   * @param {string} sessionId - ID de sesión
+   * @returns {Promise<Job>}
+   */
+  async addQrToQueue(qr, sessionId) {
+    try {
+      const job = await this.qrQueue.add(
+        { qr, sessionId },
+        {
+          priority: 5, // QRs tienen prioridad media
+          timeout: this.qrGenerationTimeout,
+        }
+      );
+
+      this.logger.info("📲 QR agregado a cola", { jobId: job.id, sessionId });
+      return job;
+    } catch (error) {
+      this.logger.error("❌ Error agregando QR a cola", error, { sessionId });
+      throw error;
+    }
+  }
+
+  /**
+   * 🎯 Configura procesador de QRs (hasta 10 simultáneos, no bloquea mensajes)
+   *
+   * @param {Function} processorFn - Función que procesa y envía QR
+   */
+  processQrGeneration(processorFn) {
+    this.qrQueue.process(this.maxConcurrentQrGeneration, async (job) => {
+      const { qr, sessionId } = job.data;
+
+      try {
+        this.logger.info("📲 Procesando QR desde cola", {
+          jobId: job.id,
+          sessionId,
+        });
+
+        const result = await processorFn(job.data);
+
+        return result;
+      } catch (error) {
+        this.logger.error("❌ Error procesando QR", error, {
+          jobId: job.id,
+          sessionId,
+        });
+
+        throw error;
+      }
+    });
+
+    this.logger.info("✅ Procesador de QR configurado", {
+      maxConcurrent: this.maxConcurrentQrGeneration,
+    });
+  }
+
+  /**
+   * 🔄 Configura el procesador de mensajes (hasta 20 simultáneos)
    *
    * @param {Function} processorFn - Función que procesa el mensaje
    */
