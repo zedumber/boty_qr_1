@@ -273,6 +273,20 @@ class QueueManager {
         },
       });
 
+      // Cola para tareas hacia Laravel (persistente y reintentable)
+      this.laravelQueue = new Queue("laravel-tasks", {
+        redis: this.redisConfig,
+        defaultJobOptions: {
+          attempts: this.config.laravelMaxRetries || 5,
+          backoff: {
+            type: "exponential",
+            delay: this.config.laravelRetryDelay || 2000,
+          },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
+      });
+
       // Configurar event listeners
       this.setupQueueEvents();
 
@@ -310,6 +324,17 @@ class QueueManager {
     this.qrQueue.on("failed", (job, err) => {
       this.logger.error("❌ QR job falló", err, { jobId: job.id });
     });
+
+    // Eventos de Laravel tasks
+    if (this.laravelQueue) {
+      this.laravelQueue.on("completed", (job) => {
+        this.logger.info("✅ Laravel job completado", { jobId: job.id });
+      });
+
+      this.laravelQueue.on("failed", (job, err) => {
+        this.logger.error("❌ Laravel job falló", err, { jobId: job.id });
+      });
+    }
   }
 
   /**
@@ -422,6 +447,36 @@ class QueueManager {
   }
 
   /**
+   * ➕ Agrega una tarea hacia Laravel a la cola persistente
+   * @param {object} task - { path, payload, type, session_id }
+   * @returns {Promise<Job>}
+   */
+  async addLaravelTaskToQueue(task) {
+    try {
+      const job = await this.laravelQueue.add(task, {
+        attempts: this.config.laravelMaxRetries || 5,
+        backoff: {
+          type: "exponential",
+          delay: this.config.laravelRetryDelay || 2000,
+        },
+        removeOnComplete: true,
+      });
+
+      this.logger.info("📥 Laravel task agregada a cola", {
+        jobId: job.id,
+        type: task.type,
+        session: task.session_id,
+      });
+      return job;
+    } catch (error) {
+      this.logger.error("❌ Error agregando Laravel task a cola", error, {
+        task,
+      });
+      throw error;
+    }
+  }
+
+  /**
    * 🎯 Configura procesador de QRs (hasta 10 simultáneos, no bloquea mensajes)
    *
    * @param {Function} processorFn - Función que procesa y envía QR
@@ -451,6 +506,35 @@ class QueueManager {
 
     this.logger.info("✅ Procesador de QR configurado", {
       maxConcurrent: this.maxConcurrentQrGeneration,
+    });
+  }
+
+  /**
+   * 🔁 Configura procesador para tareas hacia Laravel (cola persistente)
+   * @param {Function} processorFn - Función que procesa la tarea (job.data)
+   */
+  processLaravelTasks(processorFn) {
+    const concurrency = this.config.laravelConcurrency || 2;
+
+    this.laravelQueue.process(concurrency, async (job) => {
+      try {
+        this.logger.info("🔄 Procesando Laravel task desde cola", {
+          jobId: job.id,
+        });
+
+        const result = await processorFn(job.data);
+
+        return result;
+      } catch (error) {
+        this.logger.error("❌ Error procesando Laravel task", error, {
+          jobId: job.id,
+        });
+        throw error;
+      }
+    });
+
+    this.logger.info("✅ Procesador de Laravel tasks configurado", {
+      concurrency,
     });
   }
 
@@ -513,14 +597,19 @@ class QueueManager {
    */
   async getStatus() {
     try {
-      const [messageQueueCounts, qrQueueCounts] = await Promise.all([
-        this.messageQueue.getJobCounts(),
-        this.qrQueue.getJobCounts(),
-      ]);
+      const [messageQueueCounts, qrQueueCounts, laravelQueueCounts] =
+        await Promise.all([
+          this.messageQueue.getJobCounts(),
+          this.qrQueue.getJobCounts(),
+          this.laravelQueue
+            ? this.laravelQueue.getJobCounts()
+            : Promise.resolve({}),
+        ]);
 
       return {
         messageQueue: messageQueueCounts,
         qrQueue: qrQueueCounts,
+        laravelQueue: laravelQueueCounts,
         metrics: this.metrics.getMetrics(),
         circuitBreaker: this.circuitBreaker.getStatus(),
       };
@@ -559,6 +648,10 @@ class QueueManager {
 
       if (this.qrQueue) {
         await this.qrQueue.close();
+      }
+
+      if (this.laravelQueue) {
+        await this.laravelQueue.close();
       }
 
       if (this.redisClient) {
