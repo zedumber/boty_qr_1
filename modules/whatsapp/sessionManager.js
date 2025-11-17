@@ -93,7 +93,9 @@ class SessionManager {
         version,
         auth: state,
         logger: pino({ level: "silent" }),
-        browser: ["boty-SaaS", "Chrome", "1.0"],
+        // browser: ["boty-SaaS", "Chrome", "1.0"],
+        browser: ["Desktop", "Chrome", "108.0.5359.124"],
+
         printQRInTerminal: false,
       });
 

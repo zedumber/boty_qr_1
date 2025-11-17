@@ -482,14 +482,18 @@ class WhatsAppManager {
 
       // Cargar credenciales (o crear nuevas si es primera vez)
       const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-      const { version } = await fetchLatestBaileysVersion();
+      // const { version } = await fetchLatestBaileysVersion();
+      const version = [2, 2413, 7]; // versión estable aceptada por Android
+
 
       // Crear socket WhatsApp
       const sock = makeWASocket({
         version,
         auth: state,
         logger: pino({ level: "silent" }),
-        browser: ["boty-SaaS", "Chrome", "1.0"],
+        // browser: ["boty-SaaS", "Chrome", "1.0"],
+        browser: ["Desktop", "Chrome", "108.0.5359.124"],
+
         printQRInTerminal: false,
       });
 
