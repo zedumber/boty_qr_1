@@ -17,6 +17,7 @@ const {
 const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
+const { sleep, postLaravel, getQrStatus, isSessionActive } = require("./utils");
 
 class SessionManager {
   constructor(axios, laravelApi, logger, config = {}) {
@@ -36,66 +37,27 @@ class SessionManager {
   }
 
   /**
-   * ⏱️ Helper para dormir
-   */
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
    * 🌐 Envía datos a Laravel con reintentos
    */
   async postLaravel(path, body, attempts = this.maxRetries) {
-    let tryNum = 0;
-
-    while (true) {
-      tryNum++;
-      try {
-        return await this.axios.post(`${this.laravelApi}${path}`, body);
-      } catch (e) {
-        const status = e?.response?.status;
-        const retriable =
-          status === 429 || (status >= 500 && status < 600) || !status;
-
-        if (!retriable || tryNum >= attempts) {
-          throw e;
-        }
-
-        const backoff =
-          this.backoffBase * Math.pow(2, tryNum - 1) +
-          Math.floor(Math.random() * this.backoffJitter);
-
-        this.logger.warn(`🔄 Retry ${tryNum}/${attempts} ${path}`, {
-          status: status || "network",
-          backoff,
-        });
-
-        await this.sleep(backoff);
-      }
-    }
+    return postLaravel(this.axios, this.laravelApi, this.logger, path, body, {
+      attempts,
+      backoffBase: this.backoffBase,
+      backoffJitter: this.backoffJitter,
+    });
   }
 
   /**
    * 🔍 Obtiene el estado del QR en Laravel
    */
   async getSessionStatus(sessionId) {
-    try {
-      const { data } = await this.axios.get(
-        `${this.laravelApi}/whatsapp/status/${sessionId}`
-      );
-      return data?.estado_qr;
-    } catch (error) {
-      this.logger.error("❌ Error obteniendo estado de sesión", error, {
-        sessionId,
-      });
-      throw error;
-    }
+    return getQrStatus(this.axios, this.laravelApi, this.logger, sessionId);
   }
 
   /**
    * ✅ Verifica si una sesión está activa en Laravel
    */
-  async isSessionActive(sessionId) {
+  async isSessionActiveInLaravel(sessionId) {
     try {
       const estado = await this.getSessionStatus(sessionId);
       return !!estado;

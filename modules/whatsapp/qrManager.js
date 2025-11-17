@@ -9,6 +9,8 @@
  * - Sincronización con Laravel
  */
 
+const { sleep, postLaravel, getQrStatus, isSessionActive } = require("./utils");
+
 class QRManager {
   constructor(axios, laravelApi, logger, config = {}) {
     this.axios = axios;
@@ -30,73 +32,28 @@ class QRManager {
   }
 
   /**
-   * ⏱️ Helper para dormir
-   */
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
    * 🌐 Envía datos a Laravel con reintentos
    */
   async postLaravel(path, body, attempts = this.MAX_QR_RETRIES) {
-    let tryNum = 0;
-
-    while (true) {
-      tryNum++;
-      try {
-        return await this.axios.post(`${this.laravelApi}${path}`, body);
-      } catch (e) {
-        const status = e?.response?.status;
-        const retriable =
-          status === 429 || (status >= 500 && status < 600) || !status;
-
-        if (!retriable || tryNum >= attempts) {
-          throw e;
-        }
-
-        const backoff =
-          this.BACKOFF_BASE * Math.pow(2, tryNum - 1) +
-          Math.floor(Math.random() * this.BACKOFF_JITTER);
-
-        this.logger.warn(`🔄 Retry ${tryNum}/${attempts} ${path}`, {
-          status: status || "network",
-          backoff,
-        });
-
-        await this.sleep(backoff);
-      }
-    }
+    return postLaravel(this.axios, this.laravelApi, this.logger, path, body, {
+      attempts,
+      backoffBase: this.BACKOFF_BASE,
+      backoffJitter: this.BACKOFF_JITTER,
+    });
   }
 
   /**
    * 🔍 Obtiene el estado del QR en Laravel
    */
   async getQrStatus(sessionId) {
-    try {
-      const { data } = await this.axios.get(
-        `${this.laravelApi}/whatsapp/status/${sessionId}`
-      );
-      return data?.estado_qr;
-    } catch (error) {
-      this.logger.error("❌ Error obteniendo estado QR", error, { sessionId });
-      throw error;
-    }
+    return getQrStatus(this.axios, this.laravelApi, this.logger, sessionId);
   }
 
   /**
    * ✅ Verifica si una sesión está activa en Laravel
    */
-  async isSessionActive(sessionId) {
-    try {
-      const estado = await this.getQrStatus(sessionId);
-      return !!estado;
-    } catch (err) {
-      this.logger.error("❌ Error verificando sessionId en Laravel", err, {
-        sessionId,
-      });
-      return false;
-    }
+  async isSessionActiveInLaravel(sessionId) {
+    return isSessionActive(this.axios, this.laravelApi, this.logger, sessionId);
   }
 
   /**
@@ -106,7 +63,7 @@ class QRManager {
   async handleQrCode(qr, sessionId, connectionStatus) {
     if (!qr || connectionStatus === "open") return;
 
-    const active = await this.isSessionActive(sessionId);
+    const active = await this.isSessionActiveInLaravel(sessionId);
     if (!active) {
       this.logger.warn("⚠️ SessionId inactivo, ignorando QR", { sessionId });
       return;

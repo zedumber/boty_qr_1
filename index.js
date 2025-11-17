@@ -17,14 +17,28 @@ const axios = require("axios");
 const http = require("http");
 const https = require("https");
 const { v4: uuidv4 } = require("uuid");
+const Redis = require("ioredis");
+const path = require("path");
+const fs = require("fs");
+
 
 // 📦 Importar módulos
 const config = require("./config/config");
 const logger = require("./utils/logger");
 const { QueueManager } = require("./modules/queueManager");
-const WhatsAppManager = require("./modules/whatsapp"); // Nueva arquitectura modular
+const CacheManager = require("./modules/cacheManager");
+const BatchQueueManager = require("./modules/batchQueueManager");
+const WhatsAppManager = require("./modules/whatsappManager");
 const MessageReceiver = require("./modules/messageReceiver");
 const MessageSender = require("./modules/messageSender");
+
+// 🟢 Cliente Redis global
+const redisClient = new Redis({
+  host: config.redisHost,
+  port: config.redisPort,
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
 
 // 🌐 Configurar cliente HTTP con keep-alive para alto rendimiento
 const axiosHttp = axios.create({
@@ -71,6 +85,8 @@ axiosHttp.interceptors.response.use(null, async (error) => {
 
 // 🎯 Inicializar módulos
 let queueManager;
+let cacheManager;
+let batchQueueManager;
 let whatsappManager;
 let messageReceiver;
 let messageSender;
@@ -95,27 +111,44 @@ async function initializeModules() {
 
     await queueManager.initialize();
 
-    // 2. Inicializar gestor de WhatsApp
+    // 2. Inicializar gestor de cache (NUEVO)
+    // cacheManager = new CacheManager(queueManager.redis, logger);
+    cacheManager = new CacheManager(redisClient, logger);
+
+    // 3. Inicializar gestor de batching (NUEVO)
+    batchQueueManager = new BatchQueueManager(
+      axiosHttp,
+      config.laravelApi,
+      logger,
+      {
+        batchSize: config.batchSize,
+        batchInterval: config.batchInterval,
+        priorityInterval: config.priorityInterval,
+      }
+    );
+
+    // 4. Inicializar gestor de WhatsApp (ACTUALIZADO)
     whatsappManager = new WhatsAppManager(
       axiosHttp,
       config.laravelApi,
       logger,
       queueManager,
-      {
-        authDir: config.authDir,
-        maxRetries: config.maxRetries || 3,
-        qrThrottleMs: config.qrThrottleMs || 30000,
-        qrExpiresMs: config.qrExpiresMs || 60000,
-      }
+      cacheManager,
+      batchQueueManager
     );
 
-    // 3. Inicializar receptor de mensajes
+    // ⏳ LIMPIEZA AUTOMÁTICA CADA 60s
+setInterval(() => {
+  whatsappManager.cleanupDeadSessions();
+}, 60000);
+
+    // 5. Inicializar receptor de mensajes
     messageReceiver = new MessageReceiver(axiosHttp, config.laravelApi, logger);
 
-    // 4. Inicializar emisor de mensajes
+    // 6. Inicializar emisor de mensajes
     messageSender = new MessageSender(whatsappManager.sessions, logger);
 
-    // 5. Configurar procesador de cola de mensajes
+    // 7. Configurar procesador de cola de mensajes
     queueManager.processMessages(async (jobData) => {
       const { msgUpdate, sessionId } = jobData;
       const msg = msgUpdate.messages[0];
@@ -128,7 +161,7 @@ async function initializeModules() {
       return await messageReceiver.processMessage(msg, sessionId, sock);
     });
 
-    // 6. Configurar limpieza periódica de audios
+    // 8. Configurar limpieza periódica de audios
     setInterval(() => {
       messageReceiver.cleanOldAudios(config.audioMaxAge);
     }, config.audioCleanupInterval);
@@ -146,38 +179,79 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 /**
+ * 🗑️ API: Eliminar sesión de WhatsApp
+ */
+app.post("/delete-session", async (req, res) => {
+  const { session_id } = req.body;
+
+  if (!session_id) return res.status(400).json({ error: "session_id requerido" });
+
+  try {
+    await whatsappManager.deleteSession(session_id);
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ error: "No se pudo eliminar la sesión" });
+  }
+});
+
+
+/**
  * 🚀 API: Crear nueva sesión de WhatsApp
  */
-app.post("/start", async (req, res) => {
-  try {
-    const { user_id } = req.body;
+/**
+ * 🚀 API: Crear nueva sesión de WhatsApp (NUEVO FLUJO)
+ */
 
-    if (!user_id) {
+// 🚀 API: Forzar regeneración de QR para una sesión existente
+app.post("/start", async (req, res) => {
+  
+  try {
+    const { session_id: laravelSessionId, webhook_token, user_id } = req.body;
+
+    console.log("➡️ /start recibido:", req.body);
+
+    if (!webhook_token || !user_id) {
       return res.status(400).json({
-        success: false,
-        error: "user_id es requerido",
+        error: "webhook_token y user_id requeridos",
       });
     }
+    
 
-    const sessionId = uuidv4();
+    // Si Laravel envía sesión — usarla
+    const session_id = laravelSessionId || uuidv4();
 
-    logger.info("📱 Creando nueva sesión", { user_id, sessionId });
+    // 1️⃣ Resetear contador QR
+    if (!whatsappManager.qrSendCount) {
+      whatsappManager.qrSendCount = new Map();
+    }
+    whatsappManager.qrSendCount.set(session_id, 0);
 
-    await whatsappManager.startSession(sessionId, user_id);
+    // 2️⃣ Limpiar estado de QR (no invalidar Redis si no existe método)
+    whatsappManager.clearQrState(session_id);
+
+    // 3️⃣ Borrar auth viejo
+    const sessionDir = path.join(__dirname, "..", "auth", session_id);
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+
+    // 4️⃣ Guardar token
+    whatsappManager.tokens[session_id] = webhook_token;
+
+    // 5️⃣ Iniciar sesión
+    await whatsappManager.startSession(session_id, user_id, webhook_token);
 
     return res.json({
       success: true,
-      session_id: sessionId,
+      session_id,
+      webhook_token,
     });
   } catch (err) {
-    logger.error("❌ Error creando sesión", err, {
-      user_id: req.body.user_id,
-    });
+    console.error("🔥 ERROR EN /start:", err);
 
     return res.status(500).json({
-      success: false,
-      error: "No se pudo crear la sesión",
-      message: err.message,
+      error: "Error al iniciar sesión",
+      details: err.message,
     });
   }
 });
@@ -364,12 +438,63 @@ app.delete("/session/:sessionId", async (req, res) => {
 });
 
 /**
+ * 📊 API: Métricas de batching y cache
+ */
+app.get("/metrics/batch", (req, res) => {
+  try {
+    const metrics = batchQueueManager.getMetrics();
+    const content = batchQueueManager.getBatchContent();
+
+    return res.json({
+      success: true,
+      metrics,
+      content,
+    });
+  } catch (error) {
+    logger.error("❌ Error obteniendo métricas de batch", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * 💾 API: Métricas de cache
+ */
+app.get("/metrics/cache", async (req, res) => {
+  try {
+    const metrics = await cacheManager.getMetrics();
+
+    return res.json({
+      success: true,
+      metrics,
+    });
+  } catch (error) {
+    logger.error("❌ Error obteniendo métricas de cache", error);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
  * 🛑 Manejo de shutdown graceful
  */
 async function gracefulShutdown(signal) {
   logger.info(`🛑 Recibido ${signal}, cerrando gracefulmente...`);
 
   try {
+    // Flush final de batches pendientes
+    if (batchQueueManager) {
+      logger.info("📤 Flusheando batches pendientes...");
+      await batchQueueManager.flushAll();
+      batchQueueManager.stopBatchProcessor();
+    }
+
     // Cerrar sesiones de WhatsApp
     await whatsappManager.closeAllSessions();
 

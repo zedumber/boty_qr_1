@@ -9,6 +9,7 @@
  */
 
 const { DisconnectReason } = require("@whiskeysockets/baileys");
+const { sleep, postLaravel } = require("./utils");
 
 class ConnectionManager {
   constructor(axios, laravelApi, logger, config = {}) {
@@ -39,50 +40,23 @@ class ConnectionManager {
   }
 
   /**
-   * ⏱️ Helper para dormir
-   */
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
    * 🌐 Envía datos a Laravel con reintentos
    */
   async postLaravel(path, body, attempts = this.maxRetries) {
-    let tryNum = 0;
-
-    while (true) {
-      tryNum++;
-      try {
-        return await this.axios.post(`${this.laravelApi}${path}`, body);
-      } catch (e) {
-        const status = e?.response?.status;
-        const retriable =
-          status === 429 || (status >= 500 && status < 600) || !status;
-
-        if (!retriable || tryNum >= attempts) {
-          throw e;
-        }
-
-        const backoff =
-          this.backoffBase * Math.pow(2, tryNum - 1) +
-          Math.floor(Math.random() * this.backoffJitter);
-
-        this.logger.warn(`🔄 Retry ${tryNum}/${attempts} ${path}`, {
-          status: status || "network",
-          backoff,
-        });
-
-        await this.sleep(backoff);
-      }
-    }
+    return postLaravel(this.axios, this.laravelApi, this.logger, path, body, {
+      attempts,
+      backoffBase: this.backoffBase,
+      backoffJitter: this.backoffJitter,
+    });
   }
 
   /**
    * ✅ Maneja la sesión abierta
+   * NOTA: Cuando Baileys emite 'connection: open', significa que la sesión
+   * está lista. El estado DEBE pasar a "active" aquí.
    */
   async handleSessionOpen(sessionId, sessionManager) {
-    this.logger.info("✅ Sesión abierta", { sessionId });
+    this.logger.info("✅ Sesión abierta (connection='open')", { sessionId });
 
     // Ejecutar callback si existe
     if (this.callbacks.onSessionOpen) {
@@ -95,19 +69,27 @@ class ConnectionManager {
       }
     }
 
-    // Actualizar estado en Laravel
-    if (await sessionManager.isSessionActive(sessionId)) {
-      try {
-        await this.postLaravel("/whatsapp/status", {
-          session_id: sessionId,
-          estado_qr: "active",
-        });
-        this.logger.info("✅ Estado actualizado a active", { sessionId });
-      } catch (err) {
-        this.logger.error("❌ Error actualizando estado a active", err, {
-          sessionId,
-        });
-      }
+    // Verificar que la sesión sigue activa en Laravel
+    const active = await sessionManager.isSessionActiveInLaravel(sessionId);
+    if (!active) {
+      this.logger.warn("⚠️ Sesión no activa en Laravel al abrir", {
+        sessionId,
+      });
+      return;
+    }
+
+    try {
+      // Cambiar estado a "active" - significa que Baileys confirmó la conexión
+      await this.postLaravel("/whatsapp/status", {
+        session_id: sessionId,
+        estado_qr: "active",
+      });
+
+      this.logger.info("✅ Estado actualizado a active", { sessionId });
+    } catch (err) {
+      this.logger.error("❌ Error actualizando estado a active", err, {
+        sessionId,
+      });
     }
   }
 
@@ -149,7 +131,7 @@ class ConnectionManager {
       delete sessionManager.sessions[sessionId];
     } else {
       // Reintentar solo si la sesión sigue activa en Laravel
-      const active = await sessionManager.isSessionActive(sessionId);
+      const active = await sessionManager.isSessionActiveInLaravel(sessionId);
 
       if (active) {
         this.logger.info("🔄 Reintentando conexión", { sessionId });
