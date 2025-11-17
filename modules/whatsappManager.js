@@ -12,7 +12,7 @@
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
+  // fetchLatestBaileysVersion,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
 
