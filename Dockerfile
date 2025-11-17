@@ -19,8 +19,13 @@ COPY . .
 # Crea carpetas necesarias dentro del contenedor
 RUN mkdir -p /app/auth /app/audios
 
+# ---------------------------------------------
+# 🔐 Si usas Baileys, estas carpetas deben ser writable
+# ---------------------------------------------
+RUN chmod -R 777 /app/auth /app/audios
+
 # Expone el puerto en el que corre tu app
 EXPOSE 4000
 
 # Comando por defecto para correr el servidor
-CMD ["node", "index.js"]
+CMD ["node", "src/app.js"]

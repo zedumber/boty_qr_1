@@ -5,32 +5,61 @@ Servidor Node.js para gestionar sesiones de WhatsApp usando Baileys, integrado c
 ## 📁 Estructura del Proyecto
 
 ```
-prue/
-├── index_new.js              # Servidor principal (NUEVA VERSIÓN MODULAR)
-├── index.js                  # Servidor antiguo (mantener como backup)
-├── config/
-│   ├── config.js            # ⚙️ Configuración centralizada
-│   └── index.js             # Configuración legacy
-├── modules/
-│   ├── messageReceiver.js   # 📥 Recepción y procesamiento de mensajes
-│   ├── messageSender.js     # 📤 Envío de mensajes con reintentos
-│   ├── queueManager.js      # 📊 Gestión de colas Bull/Redis
-│   └── whatsappManager.js   # 📱 Gestión de sesiones WhatsApp
-├── utils/
-│   ├── lidResolver.js       # 🔍 Resolución de LIDs (Local Identifiers)
-│   └── logger.js            # 📝 Sistema de logging estructurado
-├── services/                # Archivos legacy
-│   ├── messageHandler.js
-│   ├── messageSender.js
-│   └── whatsapp.js
-├── auth/                    # 🔐 Credenciales de sesiones WhatsApp
-│   └── [session-id]/        # Carpeta por sesión
-│       ├── creds.json
-│       ├── lid-mapping-*_reverse.json
-│       └── ...
-├── audios/                  # 🔊 Archivos de audio temporales
-├── package.json
-└── README.md
+BOTY_QR_1/
+ ├─ src/
+ │   ├─ app.js
+ │   ├─ routes/
+ │   │   ├─ session.routes.js
+ │   │   ├─ message.routes.js
+ │   │   ├─ health.routes.js
+ │   │   └─ metrics.routes.js
+ │   ├─ controllers/
+ │   │   ├─ session.controller.js
+ │   │   ├─ message.controller.js
+ │   │   ├─ health.controller.js
+ │   │   └─ metrics.controller.js
+ │   ├─ services/
+ │   │   ├─ whatsapp.service.js      ← NUEVO (reescritura limpia)
+ │   │   ├─ queue.service.js         ← tu queueManager.js actual
+ │   │   ├─ cache.service.js         ← tu cacheManager.js actual
+ │   │   ├─ batch.service.js         ← tu batchQueueManager.js actual
+ │   │   ├─ message.service.js       ← tu messageSender.js actual
+ │   │   └─ receiver.service.js      ← tu messageReceiver.js actual
+ │   ├─ utils/
+ │   │   ├─ logger.js                ← tu logger.js actual
+ │   │   ├─ lidResolver.js           ← tu lidResolver.js actual
+ │   │   └─ helpers.js               ← NUEVO (sleep, etc.)
+ │   └─ config/
+ │       └─ config.js                ← tu config.js actual
+ ├─ auth/
+ ├─ audios/
+ ├─ node_modules/
+ ├─ package.json
+ └─ package-lock.json
+
+
+ 2️⃣ Archivos que se QUEDAN IGUALES (solo muévelos)
+
+Estos no los voy a reescribir, solo cámbialos de sitio:
+
+config/config.js → mover a src/config/config.js
+
+utils/logger.js → mover a src/utils/logger.js
+
+utils/lidResolver.js → mover a src/utils/lidResolver.js
+
+modules/queueManager.js → mover a src/services/queue.service.js
+
+modules/cacheManager.js → mover a src/services/cache.service.js
+
+modules/batchQueueManager.js → mover a src/services/batch.service.js
+
+modules/messageSender.js → mover a src/services/message.service.js
+
+modules/messageReceiver.js → mover a src/services/receiver.service.js
+
+Contenido igual, solo cambia el module.exports si el nombre no te cuadra; pero tal como están te van a servir.
+
 ```
 
 ## 🎯 Mejoras Implementadas
