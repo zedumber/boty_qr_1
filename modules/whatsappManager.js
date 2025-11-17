@@ -12,7 +12,7 @@
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  // fetchLatestBaileysVersion,
+  fetchLatestBaileysVersion,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
 
@@ -43,7 +43,7 @@ class WhatsAppManager {
     // Cache local de estado de sesión
     this.sessionActiveCache = new Map(); // sessionId → { active, timestamp }
 
-    // Contador de QR enviados por sesión (máx 3)
+    // Contador de QR enviados por sesión (máx 10)
     this.qrSendCount = new Map();     // sessionId → count
 
     // Almacenamiento de sesiones activas (Baileys sockets)
@@ -58,7 +58,7 @@ class WhatsAppManager {
     // Configuración
     this.QR_THROTTLE_MS = 5000;      // 5 segundos entre QR enviados
     this.QR_EXPIRES_MS = 120000;     // 120 segundos de vida del QR
-    this.MAX_QR_RETRIES = 3;
+    this.MAX_QR_RETRIES = 10;
     this.BACKOFF_BASE = 600;
     this.BACKOFF_JITTER = 400;
     this.SESSION_ACTIVE_CACHE_TTL = 30000; // 30s
@@ -223,7 +223,7 @@ class WhatsAppManager {
   }
 
   /**
-   * 📲 Maneja la generación y envío de QR codes (CON BATCH, CACHE Y LÍMITE DE 3)
+   * 📲 Maneja la generación y envío de QR codes (CON BATCH, CACHE Y LÍMITE DE 10)
    */
   async handleQrCode(qr, sessionId, connection) {
     if (!qr) return;
@@ -235,10 +235,10 @@ class WhatsAppManager {
     }
     const currentCount = this.qrSendCount.get(sessionId) || 0;
 
-    // Límite de 3 QR enviados por ciclo
-    if (currentCount >= 3) {
+    // Límite de 10 QR enviados por ciclo
+    if (currentCount >= 10) {
       this.logger.warn(
-        "⚠️ Límite de 3 QR alcanzado, no se enviarán más",
+        "⚠️ Límite de 10 QR alcanzado, no se enviarán más",
         { sessionId }
       );
       return;
@@ -482,18 +482,14 @@ class WhatsAppManager {
 
       // Cargar credenciales (o crear nuevas si es primera vez)
       const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-      // const { version } = await fetchLatestBaileysVersion();
-      const version = [2, 2413, 7]; // versión estable aceptada por Android
-
+      const { version } = await fetchLatestBaileysVersion();
 
       // Crear socket WhatsApp
       const sock = makeWASocket({
         version,
         auth: state,
         logger: pino({ level: "silent" }),
-        // browser: ["boty-SaaS", "Chrome", "1.0"],
-        browser: ["Desktop", "Chrome", "108.0.5359.124"],
-
+        browser: ["boty-SaaS", "Chrome", "1.0"],
         printQRInTerminal: false,
       });
 
