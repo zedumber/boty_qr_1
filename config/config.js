@@ -47,7 +47,7 @@ module.exports = {
   // 🎯 QR THROTTLING
   qrThrottleMs: 30000, // 30 segundos entre QR
   qrExpiresMs: 120000, // QR expira en 2 minutos (aumentado)
-  maxQrRetries: 3,
+  maxQrRetries: 10,
 
   // 🔌 CIRCUIT BREAKER
   circuitBreakerThreshold: 5, // Fallos antes de abrir

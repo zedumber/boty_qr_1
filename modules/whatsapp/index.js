@@ -32,7 +32,7 @@ class WhatsAppManager {
       backoffJitter: config.backoffJitter || 400,
       qrThrottleMs: config.qrThrottleMs || 30000,
       qrExpiresMs: config.qrExpiresMs || 60000,
-      maxQrRetries: config.maxQrRetries || 3,
+      maxQrRetries: config.maxQrRetries || 10,
     };
 
     // Inicializar managers

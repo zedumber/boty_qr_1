@@ -20,7 +20,7 @@ class QRManager {
     // Configuración de QR
     this.QR_THROTTLE_MS = config.qrThrottleMs || 30000; // 30 segundos
     this.QR_EXPIRES_MS = config.qrExpiresMs || 60000; // 60 segundos
-    this.MAX_QR_RETRIES = config.maxQrRetries || 3;
+    this.MAX_QR_RETRIES = config.maxQrRetries || 10;
     this.BACKOFF_BASE = config.backoffBase || 600;
     this.BACKOFF_JITTER = config.backoffJitter || 400;
 
