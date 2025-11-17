@@ -403,52 +403,55 @@ async isSessionActive(sessionId, options = {}) {
    * 🔌 Cuando la sesión se cierra
    */
   async handleSessionClose(sessionId, userId, lastDisconnect) {
-    const statusCode = lastDisconnect?.error?.output?.statusCode;
-    const loggedOut = statusCode === DisconnectReason.loggedOut;
+  const statusCode = lastDisconnect?.error?.output?.statusCode;
+  const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-    this.logger.info("🔌 Sesión cerrada", { sessionId, statusCode, loggedOut });
+  this.logger.info("🔌 Sesión cerrada", { sessionId, statusCode, loggedOut });
 
-    this.clearQrState(sessionId);
+  // ❗ Si la sesión nunca abrió, NO BORRARLA ❗
+  const everOpened = this.sessions[sessionId]?.everOpened;
 
-    await this.cacheManager.setStatus(
-      sessionId,
-      loggedOut ? "inactive" : "connecting"
-    );
-    this.sessionActiveCache.delete(sessionId);
+  if (!everOpened && !loggedOut) {
+    this.logger.warn("⏳ Ignorando cierre prematuro (Baileys reconectando)", { sessionId });
+    return;
+  }
 
-    if (loggedOut) {
-      this.batchQueueManager.addStatus(sessionId, "inactive", "high");
-      this.logger.info("✅ Sesión marcada como inactive (logout)", {
-        sessionId,
-      });
-      delete this.sessions[sessionId];
-    } else {
-  // 👇 Para reconectar, pending cuenta como NO activo
-  const active = await this.isSessionActive(sessionId, { forReconnect: true });
+  this.clearQrState(sessionId);
 
-  if (active) {
-    this.logger.info("🔄 Reintentando conexión", { sessionId });
+  await this.cacheManager.setStatus(
+    sessionId,
+    loggedOut ? "inactive" : "connecting"
+  );
+  this.sessionActiveCache.delete(sessionId);
 
-    setTimeout(() => {
-      this.startSession(sessionId, userId, this.tokens[sessionId]).catch(
-        (err) => {
-          this.logger.error(
-            "❌ Error reintentando conexión de sesión",
-            err,
-            { sessionId }
-          );
-        }
-      );
-    }, 2000);
-  } else {
-    this.logger.warn(
-      "⚠️ SessionId inactivo o solo en pending, no se reintenta conexión",
-      { sessionId }
-    );
+  if (loggedOut) {
     this.batchQueueManager.addStatus(sessionId, "inactive", "high");
+    this.logger.info("✅ Sesión marcada como inactive (logout)", { sessionId });
+    delete this.sessions[sessionId];
+  } else {
+    const active = await this.isSessionActive(sessionId, { forReconnect: true });
+
+    if (active) {
+      this.logger.info("🔄 Reintentando conexión", { sessionId });
+
+      setTimeout(() => {
+        this.startSession(sessionId, userId, this.tokens[sessionId]).catch(
+          (err) =>
+            this.logger.error("❌ Error reintentando conexión de sesión", err, {
+              sessionId,
+            })
+        );
+      }, 2000);
+    } else {
+      this.logger.warn(
+        "⚠️ SessionId inactivo o solo en pending, no se reintenta conexión",
+        { sessionId }
+      );
+      this.batchQueueManager.addStatus(sessionId, "inactive", "high");
+    }
   }
 }
-  }
+
   /**
    * 🧹 Limpieza de sesiones muertas
    */
