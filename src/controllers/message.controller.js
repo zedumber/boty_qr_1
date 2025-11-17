@@ -5,32 +5,42 @@
  * - Envío desde Laravel
  * - Envío rápido (legacy)
  */
-
-module.exports = function createMessageController(
-  whatsappService,
-  messageService,
-  logger
-) {
+module.exports = function createMessageController(whatsappService, messageService, logger) {
   return {
-    // POST /send-message
+
     async sendFromLaravel(req, res) {
       try {
-        const { session_id } = req.body;
+        const { session_id, wa_id, waId } = req.body;
 
-        if (!whatsappService.sessions[session_id]) {
-          return res.status(404).json({
+        // Normalizar el waId
+        const finalWaId = waId || wa_id;
+        if (!finalWaId) {
+          return res.status(400).json({
             success: false,
-            error: "Sesión no encontrada",
+            error: "WA_ID_MISSING"
+          });
+        }
+
+        const session = whatsappService.sessions[session_id];
+        const sock = session?.sock;
+
+        if (!sock || typeof sock.sendMessage !== "function") {
+          return res.status(400).json({
+            success: false,
+            error: "SESSION_NOT_CONNECTED"
           });
         }
 
         const result = await messageService.sendMessage({
           ...req.body,
+          waId: finalWaId,
           sessionId: session_id,
         });
 
-        return res.json(result);
+        return res.json(result); // ← aquí estaba el error (antes $result)
+
       } catch (err) {
+
         logger.error("❌ Error enviando mensaje", err, {
           session_id: req.body.session_id,
           wa_id: req.body.wa_id,
@@ -39,20 +49,22 @@ module.exports = function createMessageController(
 
         return res.status(500).json({
           success: false,
-          error: err.message,
+          error: err.message
         });
       }
     },
 
-    // POST /send  (rápido texto)
     async sendQuick(req, res) {
       try {
         const { session_id, to, message } = req.body;
 
-        if (!whatsappService.sessions[session_id]) {
-          return res.status(404).json({
+        const session = whatsappService.sessions[session_id];
+        const sock = session?.sock;
+
+        if (!sock || typeof sock.sendMessage !== "function") {
+          return res.status(400).json({
             success: false,
-            error: "Sesión no encontrada",
+            error: "SESSION_NOT_CONNECTED"
           });
         }
 
@@ -63,17 +75,19 @@ module.exports = function createMessageController(
         );
 
         return res.json({ success: true });
+
       } catch (err) {
-        logger.error("❌ Error en envío rápido", err, {
+
+        logger.error("❌ Error envío rápido", err, {
           session_id: req.body.session_id,
-          to: req.body.to,
+          to: req.body.to
         });
 
         return res.status(500).json({
           success: false,
-          error: err.message,
+          error: err.message
         });
       }
-    },
+    }
   };
 };

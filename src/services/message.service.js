@@ -47,7 +47,7 @@ class MessageSender {
     retries = null,
     timeout = null
   ) {
-    const sock = this.sessions[sessionId];
+    const sock = this.resolveSock(sessionId);
 
     if (!sock) {
       throw new Error(`Sesión no encontrada: ${sessionId}`);
@@ -286,7 +286,7 @@ class MessageSender {
    * @returns {object} - { exists: boolean, connected: boolean }
    */
   getSessionStatus(sessionId) {
-    const sock = this.sessions[sessionId];
+    const sock = this.resolveSock(sessionId);
 
     return {
       exists: !!sock,
@@ -294,6 +294,27 @@ class MessageSender {
       sessionId,
     };
   }
+
+  resolveSock(sessionId) {
+  const session = this.sessions[sessionId];
+
+  if (!session) {
+      throw new Error(`Sesión no encontrada: ${sessionId}`);
+  }
+
+  // Caso 1: sock directo
+  if (typeof session.sendMessage === "function") {
+      return session;
+  }
+
+  // Caso 2: socket dentro de session.sock
+  if (session.sock && typeof session.sock.sendMessage === "function") {
+      return session.sock;
+  }
+
+  throw new Error(`Socket inválido o corrupto en sesión: ${sessionId}`);
+}
+
 }
 
 module.exports = MessageSender;
