@@ -1,9 +1,17 @@
 /**
- * 🔍 Utilidad para resolver LIDs (Local Identifiers) de WhatsApp
+ * 🔍 Resolución de LIDs (Local Identifiers) para Baileys 7.x
  *
- * Los LIDs son identificadores temporales que usa WhatsApp Business API
- * cuando no puede obtener el número real directamente.
- * Este módulo implementa múltiples estrategias para resolverlos.
+ * WhatsApp en Baileys 7.x maneja LIDs con archivos automáticos:
+ *
+ *   auth/<sessionId>/lids/lid-mapping-XXXX.json
+ *   auth/<sessionId>/lids/lid-mapping-XXXX_reverse.json
+ *
+ * Además, expone:
+ *   msg.key.remoteJidAlt
+ *   msg.key.participantAlt
+ *   msg.key.participant
+ *
+ * Este módulo resuelve el JID real usando todas esas fuentes.
  */
 
 const { jidNormalizedUser } = require("@whiskeysockets/baileys");
@@ -11,21 +19,32 @@ const fs = require("fs");
 const path = require("path");
 
 /**
- * 🎯 Resuelve un JID (remoteJid) a un número de teléfono limpio
+ * 🎯 Resuelve un JID (lid o s.whatsapp.net) a un número limpio
  *
- * @param {string} fromRaw - El JID original (ej: "123456@lid" o "57123@s.whatsapp.net")
- * @param {string} sessionId - ID de la sesión para buscar archivos de mapeo
- * @param {object} msg - Objeto completo del mensaje (para acceder a remoteJidAlt)
- * @param {object} logger - Logger para registrar eventos
- * @returns {string|null} - Número de teléfono limpio o null si no se pudo resolver
+ * @param {string} fromRaw
+ * @param {string} sessionId
+ * @param {object} msg
+ * @param {object} logger
+ * @returns {string|null}
  */
 function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
   let fromClean = null;
 
-  // 📍 ESTRATEGIA 1: Usar jidNormalizedUser con remoteJidAlt (preferido)
+  // 📌 1. Elegir el mejor JID posible según Baileys 7.x
+  //
+  // PRIORIZACIÓN:
+  // 1) remoteJidAlt        (solo Baileys 7)
+  // 2) participantAlt      (cuando viene de grupos)
+  // 3) participant         (fallback grupos)
+  // 4) fromRaw             (lo que sea que venga)
+  const candidateJid =
+    msg?.key?.remoteJidAlt ||
+    msg?.key?.participantAlt ||
+    msg?.key?.participant ||
+    fromRaw;
+
+  // 📍 2. Intentar resolver con jidNormalizedUser (solo 7.x soporta LIDs reales)
   try {
-    // remoteJidAlt es una mejor fuente para resolver LIDs
-    const candidateJid = msg?.key?.remoteJidAlt || fromRaw;
     const normalized = jidNormalizedUser(candidateJid);
 
     if (normalized && /@s\.whatsapp\.net$/i.test(normalized)) {
@@ -39,29 +58,31 @@ function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
       return fromClean;
     }
   } catch (e) {
-    logger.warn("⚠️ jidNormalizedUser falló, intentando fallback", {
-      fromRaw,
-      sessionId,
+    logger.warn("⚠️ jidNormalizedUser falló, intentando siguiente estrategia", {
+      candidateJid,
       error: e.message,
+      sessionId,
     });
   }
 
-  // 📍 ESTRATEGIA 2: Si es un @s.whatsapp.net directo, extraer el número
-  if (/@s\.whatsapp\.net$/i.test(fromRaw)) {
-    fromClean = fromRaw.replace(/@s\.whatsapp\.net$/i, "");
-    logger.info("✅ Número extraído directamente de @s.whatsapp.net", {
-      fromRaw,
+  // 📍 3. Si llega ya como @s.whatsapp.net, extraerlo directo
+  if (/@s\.whatsapp\.net$/i.test(candidateJid)) {
+    fromClean = candidateJid.replace(/@s\.whatsapp\.net$/i, "");
+    logger.info("✅ Número extraído directamente de candidateJid", {
+      candidateJid,
       fromClean,
       sessionId,
     });
     return fromClean;
   }
 
-  // 📍 ESTRATEGIA 3: Resolver desde archivos de mapeo locales (lid-mapping-*_reverse.json)
-  if (/@lid$/i.test(fromRaw)) {
+  // 📍 4. Si es LID (@lid), intentar reverse mapping
+  if (/@lid$/i.test(candidateJid)) {
     try {
-      const lid = fromRaw.replace(/@lid$/i, "");
-      const sessionDir = path.join(__dirname, "..", "auth", sessionId);
+      const lid = candidateJid.replace(/@lid$/i, "");
+
+      // 📌 Path REAL para Baileys 7.x (carpeta /lids/)
+      const sessionDir = path.join(__dirname, "..", "auth", sessionId, "lids");
       const reverseMapPath = path.join(
         sessionDir,
         `lid-mapping-${lid}_reverse.json`
@@ -70,18 +91,16 @@ function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
       if (fs.existsSync(reverseMapPath)) {
         const content = fs.readFileSync(reverseMapPath, "utf8").trim();
 
-        // El archivo puede contener JSON string o directamente el número
         let phone;
         try {
           phone = JSON.parse(content);
         } catch {
-          // Si no es JSON válido, intentar extraer solo números
           phone = content.replace(/[^0-9]/g, "");
         }
 
         if (phone) {
           fromClean = String(phone);
-          logger.info("✅ Remitente resuelto desde reverse LID mapping", {
+          logger.info("✅ Remitente resuelto desde LID mapping", {
             lid,
             fromClean,
             reverseMapPath,
@@ -90,7 +109,7 @@ function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
           return fromClean;
         }
       } else {
-        logger.warn("⚠️ Archivo reverse mapping no encontrado", {
+        logger.warn("⚠️ Reverse LID mapping no encontrado", {
           reverseMapPath,
           lid,
           sessionId,
@@ -104,56 +123,53 @@ function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
     }
   }
 
-  // 📍 ESTRATEGIA 4: Fallback - extraer números directamente del JID
-  if (!fromClean) {
-    fromClean = fromRaw.replace(/(@s\.whatsapp\.net|@lid)$/i, "");
-    logger.warn("⚠️ Usando remitente sin resolver (fallback simple)", {
-      fromRaw,
-      fromClean,
-      sessionId,
-    });
-  }
+  // 📍 5. Fallback final — extraer números del JID
+  fromClean = candidateJid.replace(/(@s\.whatsapp\.net|@lid)$/i, "");
+  logger.warn("⚠️ Fallback simple usado, posible número incorrecto", {
+    candidateJid,
+    fromClean,
+    sessionId,
+  });
 
   return fromClean;
 }
 
 /**
- * 🔧 Valida si un JID es de un usuario individual (no grupo)
- *
- * @param {string} jid - El JID a validar
- * @returns {boolean} - true si es un usuario individual
+ * 🔧 Validar si un JID corresponde a usuario (no grupo)
  */
 function isValidUserJid(jid) {
-  return jid && (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid"));
+  return (
+    jid &&
+    (jid.endsWith("@s.whatsapp.net") ||
+      jid.endsWith("@lid") ||
+      jid.includes("@lid"))
+  );
 }
 
 /**
- * 📋 Lista todos los archivos de mapeo disponibles para una sesión
- *
- * @param {string} sessionId - ID de la sesión
- * @param {object} logger - Logger para registrar eventos
- * @returns {Array} - Array de objetos con información de los archivos de mapeo
+ * 📋 Lista los mapeos LID detectados
  */
 function listLidMappings(sessionId, logger = console) {
   try {
-    const sessionDir = path.join(__dirname, "..", "auth", sessionId);
+    const lidsDir = path.join(__dirname, "..", "auth", sessionId, "lids");
 
-    if (!fs.existsSync(sessionDir)) {
-      logger.warn("⚠️ Directorio de sesión no existe", {
-        sessionDir,
+    if (!fs.existsSync(lidsDir)) {
+      logger.warn("⚠️ Carpeta lids/ no existe para la sesión", {
         sessionId,
+        lidsDir,
       });
       return [];
     }
 
-    const files = fs.readdirSync(sessionDir);
+    const files = fs.readdirSync(lidsDir);
+
     const mappings = files
       .filter(
         (f) => f.startsWith("lid-mapping-") && f.endsWith("_reverse.json")
       )
       .map((f) => {
         const lid = f.replace("lid-mapping-", "").replace("_reverse.json", "");
-        const filePath = path.join(sessionDir, f);
+        const filePath = path.join(lidsDir, f);
 
         try {
           const content = fs.readFileSync(filePath, "utf8").trim();
@@ -163,23 +179,22 @@ function listLidMappings(sessionId, logger = console) {
           } catch {
             phone = content.replace(/[^0-9]/g, "");
           }
-
           return { lid, phone, filePath };
         } catch (e) {
-          logger.error("❌ Error leyendo archivo de mapeo", e, { filePath });
+          logger.error("❌ Error leyendo archivo reverse LID", e, { filePath });
           return null;
         }
       })
-      .filter((m) => m !== null);
+      .filter(Boolean);
 
-    logger.info("📋 Archivos de mapeo encontrados", {
+    logger.info("📋 LID mappings encontrados", {
       count: mappings.length,
       sessionId,
     });
 
     return mappings;
   } catch (e) {
-    logger.error("❌ Error listando archivos de mapeo", e, { sessionId });
+    logger.error("❌ Error listando LID mappings", e, { sessionId });
     return [];
   }
 }
