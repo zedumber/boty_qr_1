@@ -30,7 +30,14 @@ class WhatsAppService {
    * @param {CacheManager} cacheManager
    * @param {BatchQueueManager} batchQueueManager
    */
-  constructor(axios, laravelApi, logger, queueManager, cacheManager, batchQueueManager) {
+  constructor(
+    axios,
+    laravelApi,
+    logger,
+    queueManager,
+    cacheManager,
+    batchQueueManager
+  ) {
     this.axios = axios;
     this.laravelApi = laravelApi;
     this.logger = logger;
@@ -39,26 +46,26 @@ class WhatsAppService {
     this.batchQueueManager = batchQueueManager;
 
     // Token Laravel (webhook_token) por sessionId
-    this.tokens = {};                  // sessionId → webhook_token
+    this.tokens = {}; // sessionId → webhook_token
 
     // Cache local de estado de sesión
     this.sessionActiveCache = new Map(); // sessionId → { active, timestamp }
 
     // Contador de QR enviados por sesión
-    this.qrSendCount = new Map();      // sessionId → count
+    this.qrSendCount = new Map(); // sessionId → count
 
     // Sockets activos
-    this.sessions = {};                // sessionId → { sock, state, saveCreds, userId, webhookToken }
+    this.sessions = {}; // sessionId → { sock, state, saveCreds, userId, webhookToken }
 
     // Estado de QR
-    this.qrTimeouts = {};             // sessionId → timeoutId
-    this.lastQrSent = new Map();      // sessionId → qr string
-    this.lastQrAt = new Map();        // sessionId → timestamp ms
-    this.inflightQr = new Map();      // sessionId → bool
+    this.qrTimeouts = {}; // sessionId → timeoutId
+    this.lastQrSent = new Map(); // sessionId → qr string
+    this.lastQrAt = new Map(); // sessionId → timestamp ms
+    this.inflightQr = new Map(); // sessionId → bool
 
     // Configuración interna
-    this.QR_THROTTLE_MS = 5000;       // 5s entre QR
-    this.QR_EXPIRES_MS = 60000;      // 60s vida QR
+    this.QR_THROTTLE_MS = 5000; // 5s entre QR
+    this.QR_EXPIRES_MS = 60000; // 60s vida QR
     this.MAX_QR_RETRIES = 4;
     this.BACKOFF_BASE = 600;
     this.BACKOFF_JITTER = 400;
@@ -111,7 +118,9 @@ class WhatsAppService {
     }
 
     if (!webhookToken) {
-      this.logger.warn("⚠️ No existe webhook_token para la sesión", { sessionId });
+      this.logger.warn("⚠️ No existe webhook_token para la sesión", {
+        sessionId,
+      });
       return null;
     }
 
@@ -160,179 +169,119 @@ class WhatsAppService {
   /**
    * ✅ Verifica si una sesión está activa (cache local + Redis + Laravel)
    */
- /**
- * ✅ Verifica si una sesión está activa
- *
- * @param {string} sessionId
- * @param {{ forReconnect?: boolean }} options
- *        - forReconnect = true → si está "pending" NO se considera activa
- */
-async isSessionActive(sessionId, options = {}) {
-  const { forReconnect = false } = options;
+  /**
+   * ✅ Verifica si una sesión está activa
+   *
+   * @param {string} sessionId
+   * @param {{ forReconnect?: boolean }} options
+   *        - forReconnect = true → si está "pending" NO se considera activa
+   */
+  async isSessionActive(sessionId) {
+    try {
+      const webhookToken =
+        this.tokens[sessionId] || (await this.fetchWebhookToken(sessionId));
 
-  try {
-    let webhookToken = this.tokens[sessionId];
-
-    if (!webhookToken) {
-      webhookToken = await this.fetchWebhookToken(sessionId);
-    }
-
-    if (!webhookToken) {
-      this.logger.warn("⚠️ No se pudo obtener webhook_token", { sessionId });
-      return false;
-    }
-
-    // 1️⃣ Intentar con cache local de estados
-    const cachedActive = this.sessionActiveCache.get(sessionId);
-    if (cachedActive !== undefined) {
-      const { active, timestamp } = cachedActive;
-      if (Date.now() - timestamp < this.SESSION_ACTIVE_CACHE_TTL) {
-        return active;
+      if (!webhookToken) {
+        this.logger.warn("⚠️ No se pudo obtener webhook_token", { sessionId });
+        return false;
       }
-    }
 
-    // 2️⃣ Intentar con Redis
-    const cachedStatus = await this.cacheManager.getStatus(sessionId);
-    if (cachedStatus) {
-      let isActiveCached;
-
-      if (cachedStatus === "inactive") {
-        isActiveCached = false;
-      } else if (forReconnect && cachedStatus === "pending") {
-        // 👈 para reconexión, pending = NO activo
-        isActiveCached = false;
-      } else {
-        isActiveCached = true;
+      // 1️⃣ Cache local
+      const cached = this.sessionActiveCache.get(sessionId);
+      if (
+        cached &&
+        Date.now() - cached.timestamp < this.SESSION_ACTIVE_CACHE_TTL
+      ) {
+        return cached.active;
       }
+
+      // 2️⃣ Redis: solo "active" es realmente activo
+      const redisStatus = await this.cacheManager.getStatus(sessionId);
+      if (redisStatus) {
+        const isActive = redisStatus === "active";
+
+        this.sessionActiveCache.set(sessionId, {
+          active: isActive,
+          timestamp: Date.now(),
+        });
+
+        return isActive;
+      }
+
+      // 3️⃣ Laravel
+      const estado = await this.getQrStatus(webhookToken, sessionId);
+
+      const isActive = estado === "active";
 
       this.sessionActiveCache.set(sessionId, {
-        active: isActiveCached,
+        active: isActive,
         timestamp: Date.now(),
       });
 
-      return isActiveCached;
+      return isActive;
+    } catch (err) {
+      this.logger.error("❌ Error verificando sessionId en Laravel", err, {
+        sessionId,
+      });
+      return false;
     }
-
-    // 3️⃣ Si no hay nada en Redis, preguntar a Laravel por TOKEN
-    const estado = await this.getQrStatus(webhookToken, sessionId);
-
-    let isActive;
-    if (!estado || estado === "inactive") {
-      isActive = false;
-    } else if (forReconnect && estado === "pending") {
-      // 👈 Igual regla para reconexión
-      isActive = false;
-    } else {
-      isActive = true;
-    }
-
-    this.sessionActiveCache.set(sessionId, {
-      active: isActive,
-      timestamp: Date.now(),
-    });
-
-    return isActive;
-  } catch (err) {
-    this.logger.error("❌ Error verificando sessionId en Laravel", err, {
-      sessionId,
-    });
-
-    // Antes devolvías true (muy agresivo).
-    // Para evitar bucles, mejor ser conservador aquí:
-    return false;
   }
-}
-
 
   /**
    * 📲 Maneja la generación/envío de QR con límite + throttle + cache
    */
-  async handleQrCode(qr, sessionId, connection) {
-    if (!qr) return;
-    // if (connection === "open") return;
-    // Si está reconectando o cerrando → NO generar nuevos QR
-  if (connection === "connecting" || connection === "close") {
-    this.logger.debug("ℹ️ Ignorando QR porque la sesión está reconectando", {
+ async handleQrCode(qr, sessionId, connection) {
+  if (!qr) return;
+
+  // ❌ Antes bloqueabas los QR en connecting. Android NECESITA esos QR
+  if (connection === "close") {
+    this.logger.debug("ℹ️ Ignorando QR porque la sesión está cerrando", {
       sessionId,
       connection,
     });
     return;
   }
 
-  // Si la sesión ya abrió → NO generar QR
-  if (connection === "open") return;
-
-    if (!this.qrSendCount.has(sessionId)) {
-      this.qrSendCount.set(sessionId, 0);
-    }
-    const currentCount = this.qrSendCount.get(sessionId) || 0;
-
-    // Límite de 4 QR por ciclo
-    if (currentCount >= 4) {
-      this.logger.warn("⚠️ Límite de 4 QR alcanzado, no se enviarán más", {
-        sessionId,
-      });
-      return;
-    }
-
-    const active = await this.isSessionActive(sessionId);
-    if (!active) {
-      this.logger.warn("⚠️ Sesión inactiva en Laravel, ignorando QR", {
-        sessionId,
-      });
-      return;
-    }
-
-    const isNewQr = await this.cacheManager.isNewQr(sessionId, qr);
-    if (!isNewQr) {
-      this.logger.debug("ℹ️ QR duplicado, ignorado", { sessionId });
-      return;
-    }
-
-    const lastAt = this.lastQrAt.get(sessionId) || 0;
-    const now = Date.now();
-    const canSend = now - lastAt >= this.QR_THROTTLE_MS;
-
-    if (!canSend) {
-      this.logger.debug("ℹ️ Throttle activo → ignorando QR", { sessionId });
-      return;
-    }
-
-    if (this.inflightQr.get(sessionId)) {
-      this.logger.debug("ℹ️ Envío de QR en curso, ignorando", { sessionId });
-      return;
-    }
-
-    this.inflightQr.set(sessionId, true);
-
-    try {
-      this.logger.info("📲 Nuevo QR generado", { sessionId });
-
-      await this.cacheManager.setQr(sessionId, qr);
-
-      // BATCH hacia Laravel
-      this.batchQueueManager.addQr(sessionId, qr);
-      this.batchQueueManager.addStatus(sessionId, "pending", "normal");
-      await this.cacheManager.setStatus(sessionId, "pending");
-
-      this.lastQrSent.set(sessionId, qr);
-      this.lastQrAt.set(sessionId, now);
-      this.qrSendCount.set(sessionId, currentCount + 1);
-
-      this.logger.info("📤 QR enviado (#" + (currentCount + 1) + ")", {
-        sessionId,
-      });
-
-      this.setupQrExpiration(sessionId);
-    } catch (err) {
-      this.logger.error("❌ Error procesando QR", err, {
-        sessionId,
-        status: err?.response?.status,
-      });
-    } finally {
-      this.inflightQr.set(sessionId, false);
-    }
+  if (!this.qrSendCount.has(sessionId)) {
+    this.qrSendCount.set(sessionId, 0);
   }
+
+  const currentCount = this.qrSendCount.get(sessionId);
+
+  if (currentCount >= 4) {
+    this.logger.warn("⚠️ Límite de QR alcanzado", { sessionId });
+    return;
+  }
+
+  const isNewQr = await this.cacheManager.isNewQr(sessionId, qr);
+  if (!isNewQr) {
+    return;
+  }
+
+  if (this.inflightQr.get(sessionId)) return;
+
+  this.inflightQr.set(sessionId, true);
+
+  try {
+    this.logger.info("📲 Nuevo QR generado", { sessionId });
+
+    await this.cacheManager.setQr(sessionId, qr);
+
+    this.batchQueueManager.addQr(sessionId, qr);
+    this.batchQueueManager.addStatus(sessionId, "pending");
+    await this.cacheManager.setStatus(sessionId, "pending");
+
+    this.lastQrSent.set(sessionId, qr);
+    this.lastQrAt.set(sessionId, Date.now());
+    this.qrSendCount.set(sessionId, currentCount + 1);
+
+    this.setupQrExpiration(sessionId);
+
+  } finally {
+    this.inflightQr.set(sessionId, false);
+  }
+}
+
 
   /**
    * ⏰ Expiración automática de QR
@@ -348,7 +297,7 @@ async isSessionActive(sessionId, options = {}) {
 
         if (estado === "pending") {
           this.batchQueueManager.addStatus(sessionId, "inactive", "normal");
-          
+
           await this.cacheManager.setStatus(sessionId, "inactive");
 
           this.clearQrState(sessionId);
@@ -416,39 +365,48 @@ async isSessionActive(sessionId, options = {}) {
     );
     this.sessionActiveCache.delete(sessionId);
 
+    // ❌ Logout real → NO reconectar
     if (loggedOut) {
       this.batchQueueManager.addStatus(sessionId, "inactive", "high");
-      this.logger.info("✅ Sesión marcada como inactive (logout)", {
+      delete this.sessions[sessionId];
+      return;
+    }
+
+    // ❌ Error 405 = credenciales corruptas → NO reconectar
+    if (statusCode === 405) {
+      this.logger.warn("⛔ Sesión cerrada con 405, marcando INACTIVE", {
         sessionId,
       });
+      await this.cacheManager.setStatus(sessionId, "inactive");
+      this.batchQueueManager.addStatus(sessionId, "inactive", "high");
       delete this.sessions[sessionId];
-    } else {
-  // 👇 Para reconectar, pending cuenta como NO activo
-  const active = await this.isSessionActive(sessionId, { forReconnect: true });
+      return;
+    }
 
-  if (active) {
-    this.logger.info("🔄 Reintentando conexión", { sessionId });
+    // 🔥🔥 SOLUCIÓN: reconectar SIEMPRE (menos logout/405)
+    if (this.sessions[sessionId]?.reconnecting) {
+      this.logger.warn("⏳ Reconexión ya en progreso, ignorando...", {
+        sessionId,
+      });
+      return;
+    }
 
-    setTimeout(() => {
-      this.startSession(sessionId, userId, this.tokens[sessionId]).catch(
-        (err) => {
-          this.logger.error(
-            "❌ Error reintentando conexión de sesión",
-            err,
-            { sessionId }
-          );
-        }
-      );
-    }, 2000);
-  } else {
-    this.logger.warn(
-      "⚠️ SessionId inactivo o solo en pending, no se reintenta conexión",
-      { sessionId }
-    );
-    this.batchQueueManager.addStatus(sessionId, "inactive", "high");
+    this.sessions[sessionId] = this.sessions[sessionId] || {};
+    this.sessions[sessionId].reconnecting = true;
+
+    this.logger.info("🔄 Forzando reconexión", { sessionId });
+
+    setTimeout(async () => {
+      try {
+        await this.startSession(sessionId, userId, this.tokens[sessionId]);
+      } catch (err) {
+        this.logger.error("❌ Error en reconexión", err, { sessionId });
+      } finally {
+        this.sessions[sessionId].reconnecting = false;
+      }
+    }, 2500);
   }
-}
-  }
+
   /**
    * 🧹 Limpieza de sesiones muertas
    */
@@ -498,10 +456,10 @@ async isSessionActive(sessionId, options = {}) {
         version,
         auth: state,
         logger: pino({ level: "silent" }),
-        browser: ["boty-SaaS", "Chrome", "1.0"],
+        browser: ["Chrome", "Windows", "10"], // 👈 SEGURO PARA ANDROID E IPHONE
         printQRInTerminal: false,
+        syncFullHistory: false,
       });
-
       sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
