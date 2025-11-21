@@ -11,12 +11,16 @@
  *   msg.key.participantAlt
  *   msg.key.participant
  *
- * Este módulo resuelve el JID real usando todas esas fuentes.
+ * Este módulo resuelve el JID real usando todas esas fuentes
+ * y CREA el reverse mapping si no existe.
  */
 
 const { jidNormalizedUser } = require("@whiskeysockets/baileys");
 const fs = require("fs");
 const path = require("path");
+
+// Memoria viva: LID → número real
+global.__LID_MEMORY__ = global.__LID_MEMORY__ || {};
 
 /**
  * 🎯 Resuelve un JID (lid o s.whatsapp.net) a un número limpio
@@ -30,64 +34,151 @@ const path = require("path");
 function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
   let fromClean = null;
 
-  // 📌 1. Elegir el mejor JID posible según Baileys 7.x
-  //
-  // PRIORIZACIÓN:
-  // 1) remoteJidAlt        (solo Baileys 7)
-  // 2) participantAlt      (cuando viene de grupos)
-  // 3) participant         (fallback grupos)
-  // 4) fromRaw             (lo que sea que venga)
+  // ===================================================
+  // ✅ PRIORIDAD 0: Si YA VIENE EL NÚMERO REAL
+  // ===================================================
+  if (msg?.key?.remoteJid?.endsWith("@s.whatsapp.net")) {
+    const real = msg.key.remoteJid.replace("@s.whatsapp.net", "");
+
+    // Si también existe un LID → guardar mapping
+    if (msg?.key?.remoteJidAlt?.endsWith("@lid")) {
+      const lid = msg.key.remoteJidAlt.replace("@lid", "");
+
+      // Guardar en memoria
+      global.__LID_MEMORY__[lid] = real;
+
+      // Guardar en archivo
+      const sessionDir = path.join(__dirname, "..", "auth", sessionId, "lids");
+
+      if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true });
+      }
+
+      const reverseMapPath = path.join(
+        sessionDir,
+        `lid-mapping-${lid}_reverse.json`
+      );
+
+      if (!fs.existsSync(reverseMapPath)) {
+        fs.writeFileSync(reverseMapPath, real);
+        logger.info("✅ Reverse LID mapping creado automáticamente", {
+          lid,
+          real,
+          reverseMapPath,
+          sessionId,
+        });
+      }
+    }
+
+    logger.info("✅ Número real tomado directamente de remoteJid", {
+      real,
+      sessionId,
+    });
+
+    return real;
+  }
+
+  // ===================================================
+  // ✅ PRIORIDAD 1: Si alt ya trae el número real
+  // ===================================================
+  if (msg?.key?.remoteJidAlt?.endsWith("@s.whatsapp.net")) {
+    const clean = msg.key.remoteJidAlt.replace("@s.whatsapp.net", "");
+
+    logger.info("✅ Número directo vía remoteJidAlt", {
+      original: msg.key.remoteJidAlt,
+      clean,
+      sessionId,
+    });
+
+    return clean;
+  }
+
+  if (msg?.key?.participantAlt?.endsWith("@s.whatsapp.net")) {
+    const clean = msg.key.participantAlt.replace("@s.whatsapp.net", "");
+
+    logger.info("✅ Número directo vía participantAlt", {
+      original: msg.key.participantAlt,
+      clean,
+      sessionId,
+    });
+
+    return clean;
+  }
+
+  if (fromRaw && fromRaw.endsWith("@s.whatsapp.net")) {
+    const clean = fromRaw.replace("@s.whatsapp.net", "");
+
+    logger.info("✅ Número directo vía fromRaw", {
+      fromRaw,
+      clean,
+      sessionId,
+    });
+
+    return clean;
+  }
+
+  // ===================================================
+  // 📌 Seleccionar mejor JID candidato
+  // ===================================================
   const candidateJid =
     msg?.key?.remoteJidAlt ||
     msg?.key?.participantAlt ||
     msg?.key?.participant ||
     fromRaw;
 
-  // 📍 2. Intentar resolver con jidNormalizedUser (solo 7.x soporta LIDs reales)
+  // ===================================================
+  // 📍 Intentar normalizar con Baileys
+  // ===================================================
   try {
     const normalized = jidNormalizedUser(candidateJid);
 
     if (normalized && /@s\.whatsapp\.net$/i.test(normalized)) {
       fromClean = normalized.replace(/@s\.whatsapp\.net$/i, "");
+
       logger.info("✅ Remitente resuelto vía jidNormalizedUser", {
         candidateJid,
         normalized,
         fromClean,
         sessionId,
       });
+
       return fromClean;
     }
   } catch (e) {
-    logger.warn("⚠️ jidNormalizedUser falló, intentando siguiente estrategia", {
+    logger.warn("⚠️ jidNormalizedUser falló", {
       candidateJid,
       error: e.message,
       sessionId,
     });
   }
 
-  // 📍 3. Si llega ya como @s.whatsapp.net, extraerlo directo
-  if (/@s\.whatsapp\.net$/i.test(candidateJid)) {
-    fromClean = candidateJid.replace(/@s\.whatsapp\.net$/i, "");
-    logger.info("✅ Número extraído directamente de candidateJid", {
-      candidateJid,
-      fromClean,
-      sessionId,
-    });
-    return fromClean;
-  }
-
-  // 📍 4. Si es LID (@lid), intentar reverse mapping
+  // ===================================================
+  // 📍 Si es LID → intentar resolver
+  // ===================================================
   if (/@lid$/i.test(candidateJid)) {
+    const lid = candidateJid.replace(/@lid$/i, "");
+
+    // 🧠 1) Revisar memoria
+    if (global.__LID_MEMORY__[lid]) {
+      const real = global.__LID_MEMORY__[lid];
+
+      logger.info("✅ LID resuelto desde memoria temporal", {
+        lid,
+        real,
+        sessionId,
+      });
+
+      return real;
+    }
+
+    // 📁 2) Revisar archivo
+    const sessionDir = path.join(__dirname, "..", "auth", sessionId, "lids");
+    const reverseMapPath = path.join(
+      sessionDir,
+      `lid-mapping-${lid}_reverse.json`
+    );
+
     try {
-      const lid = candidateJid.replace(/@lid$/i, "");
-
-      // 📌 Path REAL para Baileys 7.x (carpeta /lids/)
-      const sessionDir = path.join(__dirname, "..", "auth", sessionId, "lids");
-      const reverseMapPath = path.join(
-        sessionDir,
-        `lid-mapping-${lid}_reverse.json`
-      );
-
       if (fs.existsSync(reverseMapPath)) {
         const content = fs.readFileSync(reverseMapPath, "utf8").trim();
 
@@ -99,32 +190,40 @@ function resolveLid(fromRaw, sessionId, msg = null, logger = console) {
         }
 
         if (phone) {
-          fromClean = String(phone);
-          logger.info("✅ Remitente resuelto desde LID mapping", {
+          global.__LID_MEMORY__[lid] = phone;
+
+          logger.info("✅ Remitente resuelto desde archivo LID", {
             lid,
-            fromClean,
+            phone,
             reverseMapPath,
             sessionId,
           });
-          return fromClean;
+
+          return phone;
         }
-      } else {
-        logger.warn("⚠️ Reverse LID mapping no encontrado", {
-          reverseMapPath,
-          lid,
-          sessionId,
-        });
       }
+
+      logger.warn("⚠️ Reverse LID mapping no encontrado", {
+        reverseMapPath,
+        lid,
+        sessionId,
+      });
     } catch (e) {
-      logger.error("❌ Error leyendo reverse LID mapping", e, {
-        fromRaw,
+      logger.error("❌ Error leyendo/creando reverse LID mapping", {
+        error: e.message,
+        lid,
         sessionId,
       });
     }
   }
 
-  // 📍 5. Fallback final — extraer números del JID
-  fromClean = candidateJid.replace(/(@s\.whatsapp\.net|@lid)$/i, "");
+  // ===================================================
+  // 📍 Fallback final
+  // ===================================================
+  fromClean = candidateJid
+    ?.replace(/(@s\.whatsapp\.net|@lid)$/i, "")
+    ?.replace(/[^0-9]/g, "");
+
   logger.warn("⚠️ Fallback simple usado, posible número incorrecto", {
     candidateJid,
     fromClean,
@@ -173,15 +272,20 @@ function listLidMappings(sessionId, logger = console) {
 
         try {
           const content = fs.readFileSync(filePath, "utf8").trim();
+
           let phone;
           try {
             phone = JSON.parse(content);
           } catch {
             phone = content.replace(/[^0-9]/g, "");
           }
+
           return { lid, phone, filePath };
         } catch (e) {
-          logger.error("❌ Error leyendo archivo reverse LID", e, { filePath });
+          logger.error("❌ Error leyendo archivo reverse LID", {
+            error: e.message,
+            filePath,
+          });
           return null;
         }
       })
@@ -194,7 +298,10 @@ function listLidMappings(sessionId, logger = console) {
 
     return mappings;
   } catch (e) {
-    logger.error("❌ Error listando LID mappings", e, { sessionId });
+    logger.error("❌ Error listando LID mappings", {
+      error: e.message,
+      sessionId,
+    });
     return [];
   }
 }
