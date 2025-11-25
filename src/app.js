@@ -24,9 +24,15 @@ const logger = require("./utils/logger");
 const { QueueManager } = require("./services/queue.service");
 const CacheManager = require("./services/cache.service");
 const BatchQueueManager = require("./services/batch.service");
-const WhatsAppService = require("./services/whatsapp.service");
+const WhatsAppService = require("./services/whatsapp"); // ✅ Cambio a estructura modular
 const MessageReceiver = require("./services/receiver.service");
 const MessageSender = require("./services/message.service");
+
+// Middleware
+const {
+  errorMiddleware,
+  notFoundHandler,
+} = require("./middleware/error-handler");
 
 // Controllers
 const createSessionController = require("./controllers/session.controller");
@@ -109,7 +115,11 @@ async function bootstrap() {
     );
 
     // 5) Message receiver / sender
-    const messageReceiver = new MessageReceiver(axiosHttp, config.laravelApi, logger);
+    const messageReceiver = new MessageReceiver(
+      axiosHttp,
+      config.laravelApi,
+      logger
+    );
     const messageSender = new MessageSender(whatsappService.sessions, logger);
 
     // 6) Procesar mensajes desde la cola
@@ -157,10 +167,14 @@ async function bootstrap() {
     registerHealthRoutes(app, healthController);
     registerMetricsRoutes(app, metricsController);
 
-    // 10) Restaurar sesiones activas desde Laravel
+    // 10) Middleware de manejo de errores (DEBE IR AL FINAL)
+    app.use(notFoundHandler);
+    app.use(errorMiddleware(logger));
+
+    // 11) Restaurar sesiones activas desde Laravel
     await whatsappService.restoreSessions();
 
-    // 11) Iniciar servidor
+    // 12) Iniciar servidor
     app.listen(config.port, () => {
       logger.info("🚀 Servidor iniciado correctamente", {
         port: config.port,
@@ -179,7 +193,8 @@ async function bootstrap() {
         await batchQueueManager.flushAll?.();
         batchQueueManager.stopBatchProcessor?.();
 
-        await whatsappService.closeAllSessions();
+        // ✅ Preservar credenciales en shutdown (para reconexión automática)
+        await whatsappService.closeAllSessions(true); // preserveAuth = true
         await queueManager.shutdown();
 
         logger.info("✅ Shutdown completado");

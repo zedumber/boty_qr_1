@@ -56,6 +56,46 @@ class MessageReceiver {
         return { success: true, skipped: true, reason: "from-me" };
       }
 
+      // 🚫 Filtrar eventos de protocolo/sincronización
+      const messageTypes = Object.keys(msg.message);
+      const protocolMessages = [
+        "protocolMessage",
+        "senderKeyDistributionMessage",
+        "reactionMessage",
+        "ephemeralMessage",
+        "viewOnceMessage",
+        "pollUpdateMessage",
+      ];
+
+      const hasProtocolMessage = messageTypes.some((type) =>
+        protocolMessages.includes(type)
+      );
+
+      if (hasProtocolMessage) {
+        this.logger.info("🚫 Mensaje de protocolo ignorado", {
+          messageId,
+          sessionId,
+          types: messageTypes,
+        });
+        return { success: true, skipped: true, reason: "protocol-message" };
+      }
+
+      // 🚫 Ignorar mensajes de sincronización inicial (timestamp muy antiguo)
+      const messageTimestamp = parseInt(msg.messageTimestamp) * 1000;
+      const now = Date.now();
+      const ageMinutes = (now - messageTimestamp) / 1000 / 60;
+
+      // Ignorar mensajes con más de 5 minutos de antigüedad
+      if (ageMinutes > 5) {
+        this.logger.info("🚫 Mensaje antiguo ignorado (sync inicial)", {
+          messageId,
+          sessionId,
+          ageMinutes: Math.round(ageMinutes),
+          timestamp: new Date(messageTimestamp).toISOString(),
+        });
+        return { success: true, skipped: true, reason: "old-message" };
+      }
+
       const fromRaw = msg.key.remoteJid;
 
       // 🚫 Validar tipo de remitente (solo usuarios individuales)
@@ -96,6 +136,20 @@ class MessageReceiver {
         messageId,
         sessionId,
       });
+
+      // 🚫 Ignorar mensajes de texto vacíos (eventos de sincronización)
+      if (
+        messageData.type === "text" &&
+        (!messageData.text || messageData.text.trim() === "")
+      ) {
+        this.logger.info("🚫 Mensaje de texto vacío ignorado", {
+          messageId,
+          sessionId,
+          fromClean,
+          textLength: messageData.text?.length || 0,
+        });
+        return { success: true, skipped: true, reason: "empty-text" };
+      }
 
       // 📤 Enviar a Laravel
       await this.sendToLaravel(
@@ -255,6 +309,14 @@ class MessageReceiver {
         form.append("audio", fs.createReadStream(messageData.filename));
       }
 
+      this.logger.debug("📦 Datos preparados para Laravel", {
+        from: fromClean,
+        text: messageData.text?.substring(0, 50),
+        type: messageData.type,
+        hasAudio: !!messageData.filename,
+        accountToken,
+      });
+
       // 🚀 Enviar a Laravel
       await this.axios.post(
         `${this.laravelApi}/whatsapp-webhook/${accountToken}`,
@@ -268,13 +330,26 @@ class MessageReceiver {
       this.logger.info("✅ Datos enviados a Laravel webhook", {
         sessionId,
         fromClean,
+        accountToken,
         type: messageData.type,
       });
     } catch (error) {
-      this.logger.error("❌ Error enviando datos a Laravel", error, {
+      // 🔴 Capturar respuesta de error de Laravel
+      const errorDetails = {
         sessionId,
         fromClean,
-      });
+        type: messageData.type,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        laravelError: error.response?.data, // ← ESTO muestra el error real de Laravel
+        url: error.config?.url,
+      };
+
+      this.logger.error(
+        "❌ Error enviando a Laravel (ver laravelError para detalles)",
+        error,
+        errorDetails
+      );
       throw error;
     }
   }

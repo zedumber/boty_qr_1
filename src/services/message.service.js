@@ -10,22 +10,14 @@
  * - Reintentos automáticos y timeouts
  */
 
+const { sleep } = require("../utils/helpers");
+
 class MessageSender {
   constructor(sessions, logger) {
     this.sessions = sessions; // Referencia a las sesiones activas
     this.logger = logger;
     this.defaultTimeout = 15000; // 15 segundos
     this.defaultRetries = 3;
-  }
-
-  /**
-   * ⏱️ Helper para dormir/esperar
-   *
-   * @param {number} ms - Milisegundos a esperar
-   * @returns {Promise}
-   */
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -93,7 +85,7 @@ class MessageSender {
           this.logger.info(`⏳ Esperando ${backoff}ms antes de reintentar...`, {
             sessionId,
           });
-          await this.sleep(backoff);
+          await sleep(backoff);
         }
       }
     }
@@ -296,25 +288,24 @@ class MessageSender {
   }
 
   resolveSock(sessionId) {
-  const session = this.sessions[sessionId];
+    const session = this.sessions[sessionId];
 
-  if (!session) {
+    if (!session) {
       throw new Error(`Sesión no encontrada: ${sessionId}`);
-  }
+    }
 
-  // Caso 1: sock directo
-  if (typeof session.sendMessage === "function") {
+    // Caso 1: sock directo
+    if (typeof session.sendMessage === "function") {
       return session;
-  }
+    }
 
-  // Caso 2: socket dentro de session.sock
-  if (session.sock && typeof session.sock.sendMessage === "function") {
+    // Caso 2: socket dentro de session.sock
+    if (session.sock && typeof session.sock.sendMessage === "function") {
       return session.sock;
+    }
+
+    throw new Error(`Socket inválido o corrupto en sesión: ${sessionId}`);
   }
-
-  throw new Error(`Socket inválido o corrupto en sesión: ${sessionId}`);
-}
-
 }
 
 module.exports = MessageSender;
