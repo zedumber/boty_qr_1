@@ -19,7 +19,8 @@ class ConnectionManager {
     sessionManager,
     axios,
     laravelApi,
-    logger
+    logger,
+    config = {}
   ) {
     this.stateManager = stateManager;
     this.qrManager = qrManager;
@@ -27,9 +28,21 @@ class ConnectionManager {
     this.axios = axios;
     this.laravelApi = laravelApi;
     this.logger = logger;
+    this.config = config;
 
     // Tokens de webhook por sesión
     this.tokens = {}; // sessionId → webhook_token
+
+    const reconnection = config?.reconnection || {};
+    this.reconnectConfig = {
+      fastAttempts: reconnection.fastAttempts ?? 5,
+      fastBackoffBaseMs: reconnection.fastBackoffBaseMs ?? 2000,
+      fastBackoffMaxMs: reconnection.fastBackoffMaxMs ?? 32000,
+      resilienceDelaysMs: reconnection.resilienceDelaysMs || [
+        60000, 300000, 900000,
+      ],
+      maxDurationMs: reconnection.maxDurationMs ?? 60 * 60 * 1000,
+    };
   }
 
   /**
@@ -41,12 +54,14 @@ class ConnectionManager {
     this.qrManager.clearQrState(sessionId);
 
     await this.stateManager.updateSessionStatus(sessionId, "active", "high");
+    await this.stateManager.recordTransition(sessionId, "session_open", {});
 
     // Reset contador de reconexiones
     const session = this.sessionManager.getSession(sessionId);
     if (session) {
       session.reconnectAttempts = 0;
       session.reconnecting = false;
+      session.reconnectTask = null;
     }
   }
 
@@ -58,6 +73,10 @@ class ConnectionManager {
     const loggedOut = statusCode === DisconnectReason.loggedOut;
 
     this.logger.info("🔌 Sesión cerrada", { sessionId, statusCode, loggedOut });
+    await this.stateManager.recordTransition(sessionId, "session_close", {
+      statusCode,
+      loggedOut,
+    });
 
     // Siempre limpiar estado QR y cache
     this.qrManager.clearQrState(sessionId);
@@ -79,13 +98,18 @@ class ConnectionManager {
         "inactive",
         "high"
       );
+      await this.stateManager.recordTransition(
+        sessionId,
+        "session_closed_no_reconnect",
+        { statusCode }
+      );
       this.sessionManager.removeSession(sessionId);
       return;
     }
 
     // Verificar si ya hay reconexión en progreso
     const session = this.sessionManager.getSession(sessionId);
-    if (session?.reconnecting) {
+    if (session?.reconnecting || session?.reconnectTask) {
       this.logger.warn("⏳ Reconexión ya en progreso, ignorando...", {
         sessionId,
       });
@@ -93,170 +117,304 @@ class ConnectionManager {
     }
 
     // Iniciar proceso de reconexión
-    await this.attemptReconnection(sessionId, userId, lastDisconnect);
+    this.attemptReconnection(sessionId, userId, lastDisconnect, {
+      reason: "disconnect",
+      statusCode,
+    });
   }
 
   /**
-   * 🔄 Intenta reconectar con backoff exponencial
+   * 🔄 Intenta reconectar con modo resiliencia
    */
-  async attemptReconnection(sessionId, userId, lastDisconnect) {
-    // Marcar estado como "connecting"
-    await this.stateManager.updateSessionStatus(
-      sessionId,
-      "connecting",
-      "normal"
-    );
+  attemptReconnection(sessionId, userId, lastDisconnect, context = {}) {
+    this.startReconnectWorker(sessionId, userId, {
+      ...context,
+      lastDisconnect,
+    });
+  }
 
-    // Obtener o inicializar sesión
+  requestReconnect(sessionId, userId, context = {}) {
+    this.startReconnectWorker(sessionId, userId, context);
+  }
+
+  startReconnectWorker(sessionId, userId, context = {}) {
     let session = this.sessionManager.getSession(sessionId);
     if (!session) {
       session = this.sessionManager.initializeSession(sessionId);
     }
 
-    session.reconnectAttempts = (session.reconnectAttempts || 0) + 1;
-    session.reconnecting = true;
-
-    const attempt = session.reconnectAttempts;
-    const maxAttempts = 5;
-
-    if (attempt > maxAttempts) {
-      this.logger.error("❌ Máximo de reintentos alcanzado", {
-        sessionId,
-        attempt,
-      });
-      await this.stateManager.updateSessionStatus(
-        sessionId,
-        "inactive",
-        "high"
-      );
-      this.sessionManager.removeSession(sessionId);
+    if (session.reconnecting || session.reconnectTask) {
+      this.logger.warn("⏳ Reconexión ya agendada", { sessionId });
       return;
     }
 
-    // Backoff exponencial: 2s, 4s, 8s, 16s, 32s
-    const backoffMs = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+    session.reconnectAttempts = session.reconnectAttempts || 0;
+    session.reconnecting = true;
 
-    this.logger.info("🔄 Programando reconexión", {
+    const worker = this.runReconnectLoop(sessionId, userId, context);
+    session.reconnectTask = worker;
+
+    worker
+      .catch((err) => {
+        this.logger.error("❌ Error en reconexión", err, { sessionId });
+      })
+      .finally(() => {
+        const current = this.sessionManager.getSession(sessionId);
+        if (current) {
+          current.reconnectTask = null;
+          current.reconnecting = false;
+        }
+      });
+  }
+
+  async runReconnectLoop(sessionId, userId, context = {}) {
+    await this.stateManager.updateSessionStatus(
       sessionId,
-      attempt,
-      maxAttempts,
-      backoffMs,
+      "connecting",
+      "normal"
+    );
+    await this.stateManager.recordTransition(sessionId, "reconnect_started", {
+      reason: context.reason,
     });
 
-    setTimeout(async () => {
-      try {
-        // Verificar que la sesión sigue siendo válida para reconectar
-        const isValid = await this.isSessionActive(sessionId, {
-          forReconnect: true,
-        });
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session) {
+      return;
+    }
 
-        if (!isValid) {
-          this.logger.warn("⚠️ Sesión ya no es válida para reconectar", {
-            sessionId,
-          });
-          this.sessionManager.removeSession(sessionId);
-          return;
-        }
+    const startedAt = Date.now();
+    let resilienceStartedAt = null;
 
-        // Cerrar socket anterior si existe
-        const currentSession = this.sessionManager.getSession(sessionId);
-        if (currentSession?.sock) {
-          try {
-            currentSession.sock.end();
-          } catch (_) {
-            // Ignorar errores al cerrar
-          }
-        }
-
-        this.logger.info("🔄 Ejecutando reconexión", { sessionId, attempt });
-
-        const webhookToken = this.tokens[sessionId];
-        await this.sessionManager.startSession(sessionId, userId, webhookToken);
-
-        // Reset contador en éxito
-        const reconnectedSession = this.sessionManager.getSession(sessionId);
-        if (reconnectedSession) {
-          reconnectedSession.reconnectAttempts = 0;
-          reconnectedSession.reconnecting = false;
-        }
-      } catch (err) {
-        this.logger.error("❌ Error en reconexión", err, {
+    while (session.reconnecting) {
+      const aborting = await this.abortReconnectIfActive(sessionId);
+      if (aborting) {
+        await this.stateManager.recordTransition(
           sessionId,
-          attempt,
-        });
+          "reconnect_aborted_active",
+          {
+            status: aborting.status,
+          }
+        );
+        return;
+      }
 
-        // Programar otro intento si no se alcanzó el máximo
-        const retrySession = this.sessionManager.getSession(sessionId);
-        if (retrySession && attempt < maxAttempts) {
-          retrySession.reconnecting = false;
-          await this.handleSessionClose(sessionId, userId, lastDisconnect);
-        } else {
-          await this.stateManager.updateSessionStatus(
+      session.reconnectAttempts += 1;
+      const attempt = session.reconnectAttempts;
+      const mode =
+        attempt <= this.reconnectConfig.fastAttempts ? "fast" : "resilience";
+
+      if (mode === "resilience" && !resilienceStartedAt) {
+        resilienceStartedAt = Date.now();
+        await this.stateManager.recordTransition(
+          sessionId,
+          "reconnect_resilience_mode",
+          { attempt, reason: context.reason }
+        );
+      }
+
+      await this.stateManager.recordTransition(sessionId, "reconnect_attempt", {
+        attempt,
+        mode,
+        reason: context.reason,
+      });
+
+      const success = await this.executeReconnectAttempt(sessionId, userId);
+
+      if (success) {
+        await this.stateManager.recordTransition(
+          sessionId,
+          "reconnect_success",
+          {
+            attempt,
+            durationMs: Date.now() - startedAt,
+          }
+        );
+        return;
+      }
+
+      const delay = this.getReconnectDelay(attempt);
+      if (!delay) {
+        break;
+      }
+
+      await this.stateManager.recordTransition(sessionId, "reconnect_backoff", {
+        attempt,
+        delay,
+        mode,
+      });
+
+      await sleep(delay);
+
+      if (
+        mode === "resilience" &&
+        resilienceStartedAt &&
+        Date.now() - resilienceStartedAt >= this.reconnectConfig.maxDurationMs
+      ) {
+        await this.stateManager.recordTransition(
+          sessionId,
+          "reconnect_resilience_timeout",
+          {
+            durationMs: Date.now() - resilienceStartedAt,
+          }
+        );
+        break;
+      }
+    }
+
+    await this.stateManager.recordTransition(sessionId, "reconnect_exhausted", {
+      attempts: session?.reconnectAttempts || 0,
+    });
+    await this.stateManager.updateSessionStatus(sessionId, "inactive", "high");
+    this.sessionManager.removeSession(sessionId);
+  }
+
+  async abortReconnectIfActive(sessionId) {
+    const status = await this.isSessionActive(sessionId, {
+      forReconnect: true,
+      returnDetailed: true,
+      acceptedStatuses: ["active"],
+    });
+
+    if (status.active) {
+      this.logger.info("🔁 Reintento cancelado: sesión ya activa", {
+        sessionId,
+        status: status.status,
+      });
+      return status;
+    }
+
+    return null;
+  }
+
+  async executeReconnectAttempt(sessionId, userId) {
+    try {
+      const currentSession = this.sessionManager.getSession(sessionId);
+      if (currentSession?.sock) {
+        try {
+          currentSession.sock.end();
+        } catch (err) {
+          this.logger.debug("⚠️ Error cerrando socket previo", {
             sessionId,
-            "inactive",
-            "high"
-          );
-          this.sessionManager.removeSession(sessionId);
+            error: err?.message,
+          });
         }
       }
-    }, backoffMs);
+
+      const webhookToken =
+        this.tokens[sessionId] || (await this.fetchWebhookToken(sessionId));
+      await this.sessionManager.startSession(sessionId, userId, webhookToken);
+      return true;
+    } catch (error) {
+      this.logger.error("❌ Error en intento de reconexión", error, {
+        sessionId,
+      });
+      return false;
+    }
+  }
+
+  getReconnectDelay(attempt) {
+    if (attempt <= this.reconnectConfig.fastAttempts) {
+      const exponent = attempt - 1;
+      const delay =
+        this.reconnectConfig.fastBackoffBaseMs * Math.pow(2, exponent);
+      return Math.min(delay, this.reconnectConfig.fastBackoffMaxMs);
+    }
+
+    const schedule = this.reconnectConfig.resilienceDelaysMs;
+    if (!schedule || schedule.length === 0) {
+      return null;
+    }
+
+    const index = attempt - this.reconnectConfig.fastAttempts - 1;
+    return schedule[index % schedule.length];
   }
 
   /**
    * ✅ Verifica si una sesión está activa
    */
   async isSessionActive(sessionId, options = {}) {
+    const {
+      forReconnect = false,
+      returnDetailed = false,
+      acceptedStatuses,
+      skipCache = false,
+    } = options;
+
+    const accepted = new Set(
+      acceptedStatuses?.length
+        ? acceptedStatuses
+        : forReconnect
+        ? ["active", "connecting"]
+        : ["active"]
+    );
+
+    const response = {
+      active: false,
+      status: null,
+      source: null,
+    };
+
     try {
       const webhookToken =
         this.tokens[sessionId] || (await this.fetchWebhookToken(sessionId));
 
       if (!webhookToken) {
         this.logger.warn("⚠️ No se pudo obtener webhook_token", { sessionId });
-        return false;
+        return returnDetailed ? response : false;
       }
 
       // 1️⃣ Cache local (invalidar si es para reconexión)
-      const cachedActive = this.stateManager.getFromLocalCache(
-        sessionId,
-        options.forReconnect
-      );
-      if (cachedActive !== null) {
-        return cachedActive;
+      if (!skipCache) {
+        const cachedActive = this.stateManager.getFromLocalCache(sessionId, {
+          skipForReconnect: forReconnect,
+          forReconnect,
+        });
+        if (cachedActive !== null) {
+          const status = this.stateManager.getCachedStatus(sessionId);
+          response.status = status;
+          response.source = "cache";
+          response.active = status
+            ? accepted.has(status)
+            : Boolean(cachedActive);
+          return returnDetailed ? response : response.active;
+        }
       }
 
       // 2️⃣ Redis: "active" o "connecting" son válidos para reconexión
       const redisStatus = await this.stateManager.getStatusFromRedis(sessionId);
       if (redisStatus) {
-        const isActive = options.forReconnect
-          ? redisStatus === "active" || redisStatus === "connecting"
-          : redisStatus === "active";
-
-        this.stateManager.sessionActiveCache.set(sessionId, {
-          active: isActive,
-          timestamp: Date.now(),
+        this.stateManager.setLocalSessionState(sessionId, redisStatus, {
+          active: redisStatus === "active",
+          reconnectEligible:
+            redisStatus === "active" || redisStatus === "connecting",
         });
 
-        return isActive;
+        response.status = redisStatus;
+        response.source = "redis";
+        response.active = accepted.has(redisStatus);
+        return returnDetailed ? response : response.active;
       }
 
       // 3️⃣ Laravel
       const estado = await this.getQrStatus(webhookToken, sessionId);
 
-      const isActive = options.forReconnect
-        ? estado === "active" || estado === "connecting"
-        : estado === "active";
+      if (estado) {
+        this.stateManager.setLocalSessionState(sessionId, estado, {
+          active: estado === "active",
+          reconnectEligible: estado === "active" || estado === "connecting",
+        });
 
-      this.stateManager.sessionActiveCache.set(sessionId, {
-        active: isActive,
-        timestamp: Date.now(),
-      });
+        response.status = estado;
+        response.source = "laravel";
+        response.active = accepted.has(estado);
+      }
 
-      return isActive;
+      return returnDetailed ? response : response.active;
     } catch (err) {
       this.logger.error("❌ Error verificando sessionId en Laravel", err, {
         sessionId,
       });
-      return false;
+      return returnDetailed ? response : false;
     }
   }
 

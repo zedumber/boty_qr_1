@@ -101,6 +101,7 @@ async function bootstrap() {
         batchSize: config.batchSize,
         batchInterval: config.batchInterval,
         priorityInterval: config.priorityInterval,
+        lifecycle: config.lifecycle,
       }
     );
 
@@ -111,7 +112,8 @@ async function bootstrap() {
       logger,
       queueManager,
       cacheManager,
-      batchQueueManager
+      batchQueueManager,
+      config
     );
 
     // 5) Message receiver / sender
@@ -137,6 +139,14 @@ async function bootstrap() {
 
     // 7) Limpieza periódica de sesiones muertas
     setInterval(() => whatsappService.cleanupDeadSessions(), 60000);
+
+    // 7b) Watchdog de heartbeats
+    if (config.watchdog?.intervalMs) {
+      setInterval(
+        () => whatsappService.runSessionWatchdog(),
+        config.watchdog.intervalMs
+      );
+    }
 
     // 8) Express
     const app = express();

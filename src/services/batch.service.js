@@ -18,14 +18,19 @@ class BatchQueueManager {
     this.batchSize = config.batchSize || 50;
     this.batchInterval = config.batchInterval || 5000; // 5 segundos
     this.priorityInterval = config.priorityInterval || 1000; // 1 segundo para high priority
+    this.lifecycleEndpoint = config?.lifecycle?.batchEndpoint || null;
+    this.lifecycleBatchInterval =
+      config?.lifecycle?.batchInterval || this.batchInterval;
 
     // Colas de batch
     this.qrBatch = new Map(); // sessionId -> {qr, timestamp}
     this.statusBatch = new Map(); // sessionId -> {status, priority, timestamp}
+    this.lifecycleBatch = []; // {session_id, event, meta, timestamp}
 
     // Timestamps
     this.lastFlushQr = 0;
     this.lastFlushStatus = 0;
+    this.lastFlushLifecycle = 0;
 
     // Iniciar procesador de batches
     this.startBatchProcessor();
@@ -71,6 +76,29 @@ class BatchQueueManager {
     // Flush inmediato si es high priority
     if (priority === "high") {
       this.flushStatusBatch(true);
+    }
+  }
+
+  /**
+   * 🧭 Agrega eventos de ciclo de vida
+   */
+  addLifecycleEvent(sessionId, event, meta = {}, priority = "normal") {
+    if (!this.lifecycleEndpoint) {
+      return;
+    }
+
+    this.lifecycleBatch.push({
+      session_id: sessionId,
+      event,
+      meta,
+      priority,
+      timestamp: Date.now(),
+    });
+
+    if (this.lifecycleBatch.length >= this.batchSize) {
+      this.flushLifecycleBatch(true).catch((err) =>
+        this.logger.error("❌ Error forzando lifecycle batch", err)
+      );
     }
   }
 
@@ -205,6 +233,51 @@ class BatchQueueManager {
   }
 
   /**
+   * 🚀 Envía batch de eventos de ciclo de vida
+   */
+  async flushLifecycleBatch(force = false) {
+    if (!this.lifecycleEndpoint || this.lifecycleBatch.length === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && now - this.lastFlushLifecycle < this.lifecycleBatchInterval) {
+      return;
+    }
+
+    const batch = [...this.lifecycleBatch];
+    this.lifecycleBatch = [];
+    this.lastFlushLifecycle = now;
+
+    try {
+      this.logger.info("📤 Enviando batch de lifecycle", {
+        count: batch.length,
+        endpoint: this.lifecycleEndpoint,
+      });
+
+      const response = await this.axios.post(
+        `${this.laravelApi}${this.lifecycleEndpoint}`,
+        {
+          events: batch,
+        }
+      );
+
+      this.logger.info("✅ Batch de lifecycle enviado", {
+        count: batch.length,
+        statusCode: response.status,
+      });
+    } catch (error) {
+      this.logger.error("❌ Error enviando batch de lifecycle", error, {
+        count: batch.length,
+        endpoint: this.lifecycleEndpoint,
+      });
+
+      this.lifecycleBatch.unshift(...batch);
+      throw error;
+    }
+  }
+
+  /**
    * ⏰ Inicia el procesador automático de batches
    */
   startBatchProcessor() {
@@ -226,9 +299,22 @@ class BatchQueueManager {
       }
     }, this.priorityInterval);
 
+    if (this.lifecycleEndpoint) {
+      this.lifecycleInterval = setInterval(() => {
+        if (this.lifecycleBatch.length > 0) {
+          this.flushLifecycleBatch(false).catch((err) => {
+            this.logger.error("❌ Error en intervalo lifecycle batch", err);
+          });
+        }
+      }, this.lifecycleBatchInterval);
+    }
+
     this.logger.info("⏰ Batch processor iniciado", {
       qrInterval: this.batchInterval,
       statusInterval: this.priorityInterval,
+      lifecycleInterval: this.lifecycleEndpoint
+        ? this.lifecycleBatchInterval
+        : 0,
     });
   }
 
@@ -238,6 +324,7 @@ class BatchQueueManager {
   stopBatchProcessor() {
     if (this.qrInterval) clearInterval(this.qrInterval);
     if (this.statusInterval) clearInterval(this.statusInterval);
+    if (this.lifecycleInterval) clearInterval(this.lifecycleInterval);
     this.logger.info("🛑 Batch processor detenido");
   }
 
@@ -246,7 +333,11 @@ class BatchQueueManager {
    */
   async flushAll() {
     try {
-      await Promise.all([this.flushQrBatch(), this.flushStatusBatch(true)]);
+      await Promise.all([
+        this.flushQrBatch(),
+        this.flushStatusBatch(true),
+        this.flushLifecycleBatch(true),
+      ]);
       this.logger.info("✅ Todos los batches flushed");
     } catch (error) {
       this.logger.error("❌ Error en flush all", error);

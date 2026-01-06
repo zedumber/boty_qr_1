@@ -29,7 +29,8 @@ class WhatsAppService {
     logger,
     queueManager,
     cacheManager,
-    batchQueueManager
+    batchQueueManager,
+    config = {}
   ) {
     this.axios = axios;
     this.laravelApi = laravelApi;
@@ -37,6 +38,7 @@ class WhatsAppService {
     this.queueManager = queueManager;
     this.cacheManager = cacheManager;
     this.batchQueueManager = batchQueueManager;
+    this.config = config;
 
     const authDir = path.join(__dirname, "..", "..", "auth");
 
@@ -46,7 +48,8 @@ class WhatsAppService {
     this.stateManager = new StateManager(
       cacheManager,
       batchQueueManager,
-      logger
+      logger,
+      config
     );
 
     this.qrManager = new QRManager(
@@ -62,7 +65,8 @@ class WhatsAppService {
       null, // sessionManager se asigna después
       axios,
       laravelApi,
-      logger
+      logger,
+      config
     );
 
     this.sessionManager = new SessionManager(
@@ -72,7 +76,9 @@ class WhatsAppService {
       queueManager,
       axios,
       laravelApi,
-      logger
+      logger,
+      this.stateManager,
+      config
     );
 
     // Resolver dependencia circular
@@ -137,6 +143,13 @@ class WhatsAppService {
    */
   async cleanupDeadSessions() {
     return await this.sessionManager.cleanupDeadSessions();
+  }
+
+  /**
+   * ⏱️ Ejecuta watchdog manual
+   */
+  async runSessionWatchdog() {
+    return await this.sessionManager.runWatchdog();
   }
 
   // ==========================================

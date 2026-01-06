@@ -19,6 +19,7 @@ class CacheManager {
       status: 120, // Estado expira en 120s
       connection: 30, // Conexión expira en 30s
       session: 300, // Sesión expira en 5 minutos
+      health: 600, // Datos de salud expiran en 10 minutos
     };
   }
 
@@ -30,6 +31,8 @@ class CacheManager {
     status: (sessionId) => `session:${sessionId}:status`,
     connection: (sessionId) => `session:${sessionId}:connection`,
     session: (sessionId) => `session:${sessionId}:info`,
+    lifecycle: (sessionId) => `session:${sessionId}:lifecycle`,
+    health: (sessionId) => `session:${sessionId}:health`,
   };
 
   /**
@@ -90,16 +93,105 @@ class CacheManager {
   }
 
   async clearQr(sessionId) {
-  const key = this.keys.qr(sessionId);
-  try {
-    await this.redis.del(key);
-    return true;
-  } catch (err) {
-    this.logger.error("❌ Error limpiando QR", err, { sessionId });
-    return false;
+    const key = this.keys.qr(sessionId);
+    try {
+      await this.redis.del(key);
+      return true;
+    } catch (err) {
+      this.logger.error("❌ Error limpiando QR", err, { sessionId });
+      return false;
+    }
   }
-}
 
+  /**
+   * 🧾 Guarda eventos de ciclo de vida (ring buffer)
+   */
+  async pushLifecycleEvent(sessionId, event, limit = 50) {
+    const key = this.keys.lifecycle(sessionId);
+    const payload = JSON.stringify({
+      ...event,
+      timestamp: event.timestamp || Date.now(),
+    });
+
+    try {
+      await this.redis.lpush(key, payload);
+      await this.redis.ltrim(key, 0, limit - 1);
+      await this.redis.expire(key, this.ttl.session);
+    } catch (error) {
+      this.logger.error("❌ Error guardando lifecycle event", error, {
+        sessionId,
+      });
+    }
+  }
+
+  /**
+   * 📈 Incrementa contador de limpiezas fallidas consecutivas
+   */
+  async incrementCleanupMiss(sessionId) {
+    const key = this.keys.health(sessionId);
+    try {
+      const misses = await this.redis.hincrby(key, "cleanupMisses", 1);
+      await this.redis.expire(key, this.ttl.health);
+      return misses;
+    } catch (error) {
+      this.logger.error("❌ Error incrementando cleanupMisses", error, {
+        sessionId,
+      });
+      return 1;
+    }
+  }
+
+  async resetCleanupMiss(sessionId) {
+    const key = this.keys.health(sessionId);
+    try {
+      await this.redis.hdel(key, "cleanupMisses");
+    } catch (error) {
+      this.logger.error("❌ Error reseteando cleanupMisses", error, {
+        sessionId,
+      });
+    }
+  }
+
+  async getCleanupMisses(sessionId) {
+    const key = this.keys.health(sessionId);
+    try {
+      const misses = await this.redis.hget(key, "cleanupMisses");
+      return misses ? parseInt(misses, 10) : 0;
+    } catch (error) {
+      this.logger.error("❌ Error leyendo cleanupMisses", error, {
+        sessionId,
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * ❤️ Marca el último heartbeat registrado
+   */
+  async setHeartbeat(sessionId, timestamp = Date.now()) {
+    const key = this.keys.health(sessionId);
+    try {
+      await this.redis.hset(key, "lastHeartbeat", timestamp);
+      await this.redis.expire(key, this.ttl.health);
+      return timestamp;
+    } catch (error) {
+      this.logger.error("❌ Error guardando heartbeat", error, {
+        sessionId,
+      });
+      return null;
+    }
+  }
+
+  async getHeartbeat(sessionId) {
+    const key = this.keys.health(sessionId);
+    try {
+      const value = await this.redis.hget(key, "lastHeartbeat");
+      return value ? Number(value) : null;
+    } catch (error) {
+      this.logger.error("❌ Error leyendo heartbeat", error, { sessionId });
+      return null;
+    }
+  }
 
   /**
    * 🗑️ Invalida cache por patrón

@@ -20,7 +20,9 @@ class SessionManager {
     queueManager,
     axios,
     laravelApi,
-    logger
+    logger,
+    stateManager,
+    config = {}
   ) {
     this.socketFactory = socketFactory;
     this.connectionManager = connectionManager;
@@ -29,6 +31,8 @@ class SessionManager {
     this.axios = axios;
     this.laravelApi = laravelApi;
     this.logger = logger;
+    this.stateManager = stateManager;
+    this.config = config;
 
     // Sockets activos
     this.sessions = {}; // sessionId → { sock, state, saveCreds, userId, webhookToken, reconnectAttempts, reconnecting }
@@ -37,6 +41,19 @@ class SessionManager {
     this.MAX_RETRIES = 4;
     this.BACKOFF_BASE = 600;
     this.BACKOFF_JITTER = 400;
+
+    this.cleanupConfig = {
+      inactivityGraceMs: config?.cleanup?.inactivityGraceMs ?? 120000,
+      consecutiveMissThreshold: config?.cleanup?.consecutiveMissThreshold ?? 3,
+    };
+
+    this.watchdogConfig = {
+      intervalMs: config?.watchdog?.intervalMs ?? 60000,
+      inactivityThresholdMs:
+        config?.watchdog?.inactivityThresholdMs ?? 10 * 60 * 1000,
+    };
+
+    this.cleanupMissCounter = new Map();
   }
 
   /**
@@ -79,7 +96,11 @@ class SessionManager {
         webhookToken,
         reconnectAttempts: 0,
         reconnecting: false,
+        reconnectTask: null,
+        lastHeartbeatAt: Date.now(),
       };
+
+      await this.stateManager.updateHeartbeat(sessionId);
 
       this.logger.info("✅ Sesión iniciada correctamente", { sessionId });
 
@@ -104,6 +125,8 @@ class SessionManager {
       sessionId,
     });
 
+    await this.recordHeartbeat(sessionId, "connection.update");
+
     if (qr) {
       await this.qrManager.handleQrCode(qr, sessionId, connection);
     }
@@ -121,12 +144,33 @@ class SessionManager {
     }
   }
 
+  async recordHeartbeat(sessionId, source = "event") {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+
+    const timestamp = Date.now();
+    session.lastHeartbeatAt = timestamp;
+
+    try {
+      await this.stateManager.updateHeartbeat(sessionId, timestamp);
+    } catch (error) {
+      this.logger.warn("⚠️ No se pudo registrar heartbeat", {
+        sessionId,
+        source,
+        error: error?.message,
+      });
+    }
+  }
+
   /**
    * 💬 Maneja mensajes entrantes
    */
   async handleMessagesUpsert(msgUpdate, sessionId) {
     try {
       await this.queueManager.addMessageToQueue(msgUpdate, sessionId);
+      await this.recordHeartbeat(sessionId, "message");
     } catch (error) {
       this.logger.error("❌ Error agregando mensaje a cola", error, {
         messageId: msgUpdate.messages[0]?.key?.id,
@@ -235,6 +279,9 @@ class SessionManager {
       this.logger.error("❌ Error eliminando sesión", error, { sessionId });
       throw error;
     }
+
+    this.cleanupMissCounter.delete(sessionId);
+    await this.stateManager.resetCleanupMiss(sessionId);
   }
 
   /**
@@ -242,12 +289,17 @@ class SessionManager {
    */
   getSessionInfo(sessionId) {
     const session = this.sessions[sessionId];
+    const statusSnapshot = this.stateManager?.getStatusSnapshot(sessionId);
 
     return {
       exists: !!session,
       connected: session?.sock?.user ? true : false,
       user: session?.sock?.user || null,
       sessionId,
+      status: statusSnapshot?.status || null,
+      statusUpdatedAt: statusSnapshot?.updatedAt || null,
+      reconnecting: Boolean(session?.reconnecting),
+      lastHeartbeatAt: session?.lastHeartbeatAt || null,
     };
   }
 
@@ -284,18 +336,144 @@ class SessionManager {
    * 🧹 Limpia sesiones muertas
    */
   async cleanupDeadSessions() {
+    const now = Date.now();
     const allSessions = Object.keys(this.sessions);
 
     for (const sessionId of allSessions) {
-      const active = await this.connectionManager.isSessionActive(sessionId);
+      const session = this.sessions[sessionId];
+      if (!session) {
+        continue;
+      }
 
-      if (!active) {
-        this.logger.warn("🗑️ Eliminando sesión inactiva automáticamente", {
+      if (session.reconnecting) {
+        this.logger.debug("⏭️ Omitiendo cleanup: reconexión activa", {
           sessionId,
         });
+        continue;
+      }
+
+      const status = await this.connectionManager.isSessionActive(sessionId, {
+        forReconnect: true,
+        returnDetailed: true,
+        acceptedStatuses: ["active", "connecting", "pending"],
+        skipCache: true,
+      });
+
+      if (status.active) {
+        await this.resetCleanupCounter(sessionId);
+        continue;
+      }
+
+      const lastHeartbeat =
+        session.lastHeartbeatAt ||
+        (await this.stateManager.getLastHeartbeat(sessionId));
+      const idleMs = lastHeartbeat ? now - lastHeartbeat : null;
+
+      if (idleMs !== null && idleMs < this.cleanupConfig.inactivityGraceMs) {
+        continue;
+      }
+
+      const miss = await this.incrementCleanupMiss(sessionId);
+
+      await this.stateManager.recordTransition(
+        sessionId,
+        "cleanup_inactive_detected",
+        {
+          miss,
+          idleMs,
+          status: status.status,
+        }
+      );
+
+      if (miss < this.cleanupConfig.consecutiveMissThreshold) {
+        continue;
+      }
+
+      await this.stateManager.recordTransition(
+        sessionId,
+        "cleanup_force_delete",
+        {
+          miss,
+          status: status.status,
+        }
+      );
+
+      this.logger.warn("🗑️ Eliminando sesión inactiva automáticamente", {
+        sessionId,
+        miss,
+        idleMs,
+      });
+
+      try {
         await this.deleteSession(sessionId);
+        await this.stateManager.updateSessionStatus(
+          sessionId,
+          "inactive",
+          "high"
+        );
+      } catch (err) {
+        this.logger.error("❌ Error cerrando sesión", err, { sessionId });
+      } finally {
+        await this.resetCleanupCounter(sessionId);
       }
     }
+  }
+
+  /**
+   * ⏱️ Watchdog de heartbeats
+   */
+  async runWatchdog() {
+    const threshold = this.watchdogConfig?.inactivityThresholdMs;
+    if (!threshold) {
+      return;
+    }
+
+    const now = Date.now();
+    const sessions = Object.entries(this.sessions);
+
+    for (const [sessionId, session] of sessions) {
+      if (!session) continue;
+      if (session.reconnecting) continue;
+
+      const lastHeartbeat =
+        session.lastHeartbeatAt ||
+        (await this.stateManager.getLastHeartbeat(sessionId));
+      if (!lastHeartbeat) continue;
+
+      const idleMs = now - lastHeartbeat;
+      if (idleMs < threshold) continue;
+
+      await this.stateManager.recordTransition(
+        sessionId,
+        "watchdog_idle_detected",
+        {
+          idleMs,
+          threshold,
+        }
+      );
+
+      this.logger.warn("⏰ Watchdog solicitando reconexión", {
+        sessionId,
+        idleMs,
+      });
+
+      this.connectionManager.requestReconnect(sessionId, session.userId, {
+        reason: "watchdog",
+        idleMs,
+      });
+    }
+  }
+
+  async incrementCleanupMiss(sessionId) {
+    const misses = (this.cleanupMissCounter.get(sessionId) || 0) + 1;
+    this.cleanupMissCounter.set(sessionId, misses);
+    await this.stateManager.incrementCleanupMiss(sessionId);
+    return misses;
+  }
+
+  async resetCleanupCounter(sessionId) {
+    this.cleanupMissCounter.delete(sessionId);
+    await this.stateManager.resetCleanupMiss(sessionId);
   }
 
   /**
@@ -317,6 +495,8 @@ class SessionManager {
       webhookToken: null,
       reconnectAttempts: 0,
       reconnecting: false,
+      reconnectTask: null,
+      lastHeartbeatAt: null,
     };
     return this.sessions[sessionId];
   }

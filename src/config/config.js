@@ -35,6 +35,13 @@ module.exports = {
   batchInterval: 5000, // Enviar cada 5 segundos
   priorityInterval: 1000, // High priority cada 1 segundo
 
+  // 🧭 Eventos de ciclo de vida
+  lifecycle: {
+    cacheLimit: 50,
+    batchEndpoint: "/whatsapp/lifecycle/batch",
+    batchInterval: 5000,
+  },
+
   // 💾 CACHE - Reducir consultas a Laravel
   cacheEnabled: true,
   cacheTtl: {
@@ -52,4 +59,25 @@ module.exports = {
   // 🔌 CIRCUIT BREAKER
   circuitBreakerThreshold: 5, // Fallos antes de abrir
   circuitBreakerTimeout: 60000, // 60 segundos de timeout
+
+  // ♻️ Reconexión avanzada
+  reconnection: {
+    fastAttempts: 5,
+    fastBackoffBaseMs: 2000,
+    fastBackoffMaxMs: 32000,
+    resilienceDelaysMs: [60000, 5 * 60 * 1000, 15 * 60 * 1000],
+    maxDurationMs: 60 * 60 * 1000, // 60 minutos
+  },
+
+  // 🧹 Limpieza de sesiones
+  cleanup: {
+    inactivityGraceMs: 120000, // 2 minutos de gracia antes de contar
+    consecutiveMissThreshold: 3, // Intentos fallidos antes de eliminar
+  },
+
+  // ⏱️ Watchdog de heartbeats
+  watchdog: {
+    intervalMs: 60000, // revisar cada minuto
+    inactivityThresholdMs: 10 * 60 * 1000, // 10 minutos sin eventos → reconectar
+  },
 };
